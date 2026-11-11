@@ -1,7 +1,9 @@
 import { common } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { webview } from '@kit.ArkWeb';
+import { hilog } from '@kit.PerformanceAnalysisKit';
 import BuildProfile from 'BuildProfile';
+import { Constants } from '../common/Constants';
 import { DshRuntime, LaunchPhase, LaunchSnapshot } from '../app/DshRuntime';
 
 /**
@@ -76,6 +78,35 @@ struct Index {
     context.terminateSelf().catch((error: BusinessError): void => {
       this.detail = `退出失败：${error.message}`;
     });
+  }
+
+  /**
+   * 113-system-back：把系统返回转发给 Web UI seam（`window.__dshSystemBack`，由
+   * `@dsh-ohos/back` 经 webserver/index-inject 注入）。seam 未就绪/页面未加载时静默降级
+   * （记录日志，不做任何事）——返回键由 `onBackPress` 统一消费，永不退出应用。
+   */
+  private dispatchSystemBack(): void {
+    try {
+      this.controller.runJavaScript('(window.__dshSystemBack ? window.__dshSystemBack() : false)')
+        .then((result: string): void => {
+          hilog.info(Constants.HILOG_DOMAIN, Constants.HILOG_TAG, 'systemBack seam result: %{public}s', result);
+        })
+        .catch((error: BusinessError): void => {
+          hilog.warn(Constants.HILOG_DOMAIN, Constants.HILOG_TAG, 'systemBack runJavaScript failed: %{public}s', error.message);
+        });
+    } catch (error) {
+      const message: string = error instanceof Error ? error.message : String(error);
+      hilog.warn(Constants.HILOG_DOMAIN, Constants.HILOG_TAG, 'systemBack dispatch error: %{public}s', message);
+    }
+  }
+
+  /**
+   * 113-system-back：系统返回一律消费（return true）——设置页/抽屉/弹窗由 seam 关闭；
+   * 首页/会话页无操作；应用永不因返回键退出。
+   */
+  onBackPress(): boolean {
+    this.dispatchSystemBack();
+    return true;
   }
 
   build() {

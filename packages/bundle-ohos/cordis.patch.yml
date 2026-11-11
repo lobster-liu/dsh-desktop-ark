@@ -147,3 +147,7 @@
     # 浏览器半边占用 `sidebar.brand.mark` / `sidebar.brand.name` / `conversation.hero.brand.mark`。
     - id: branding-ohos
       name: '@dsh-ohos/branding'
+
+    # 系统返回 seam（113-system-back）：Web UI 内设置页/弹窗关闭、抽屉收回、首页/会话页无操作。
+    - id: back-ohos
+      name: '@dsh-ohos/back'
