@@ -104,3 +104,8 @@
 | `entry/src/main/ets/pages/Index.ets` | 启动覆盖层标题 |
 | `entry/src/main/resources/rawfile/boot.html` | boot 页标题 |
 | `packages/branding-ohos/` | Web 品牌位（205，不在本模块实现） |
+
+## 9. r2 修订（包名）
+
+- `AppScope/app.json5` bundleName 由 `org.fellow99.dsh.DshDesktopArk` 改为 `top.fellow99.dsh.DshDesktopArk`（仅域名前缀 org→top）。
+- 源代码无 hardcode bundleName（ArkWeb 壳按需随系统上下文获取）；仅同步 `hvigorfile.ts` 签名注释。

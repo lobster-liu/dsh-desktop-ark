@@ -3,6 +3,7 @@
 > Module: 013-branding
 > Status: Implemented（as-built）
 > Last Updated: 2026-11-01
+> 修订 r2（包名）：bundleName 纳入本模块登记，改为 `top.fellow99.dsh.DshDesktopArk`（r2 前为 `org.fellow99.dsh.DshDesktopArk`）。签名/版本/ACL 仍属 `108-compliance-release`。
 
 ## 1. 模块概述
 
@@ -28,7 +29,7 @@
 **不包含：**
 
 - Web UI 内部品牌位（`brand.localBuild` / `hero` / 页面标题）——由 `205-plugin-branding` 以零补丁 seam 实现。
-- 包名 `org.fellow99.dsh.DshDesktopArk`、版本号、签名与 ACL（属 `108-compliance-release`）。
+- 包名 `top.fellow99.dsh.DshDesktopArk`（r2 起由本模块登记）、版本号、签名与 ACL（签名/版本/ACL 属 `108-compliance-release`）。
 - 应用商店 listing 文案与截图。
 
 ## 2. 用户故事
@@ -44,7 +45,7 @@
 - FR-013-001：`AppScope/resources/base/element/string.json` 的 `app_name` MUST 为 `DSH Desktop Ark`。
 - FR-013-002：`entry/src/main/resources/base/element/string.json` 的 `EntryAbility_label` MUST 为 `DSH Desktop Ark`。
 - FR-013-003：`AppScope/app.json5` MUST 通过 `$media:app_icon` 与 `$string:app_name` 引用应用图标与名称。
-- FR-013-004：应用包名、`versionName`、`versionCode` MUST 由 `108-compliance-release` 管理，本模块不修改。
+- FR-013-004：应用 `bundleName` MUST 为 `top.fellow99.dsh.DshDesktopArk`（r2）；`versionName`、`versionCode`、签名 MUST 由 `108-compliance-release` 管理。
 
 ### 3.2 图标
 
@@ -104,10 +105,10 @@
 ## 7. 假设与约束
 
 - 应用级名称 `DSH Desktop Ark` 用于区分同一设备上的 Electron 版（`DSH Desktop`）。
-- 约束：不修改包名与签名材料；不实现 Web 品牌位（属 205）。
+- 约束：bundleName 由本模块登记（r2）；不修改签名材料；不实现 Web 品牌位（属 205）。
 - 约束：图标物料必须符合 HarmonyOS 应用图标规范。
 
 ## 8. 依赖
 
 - 物料：父工程 `assets/`。
-- 下游：`108-compliance-release`（包名/签名/版本）、`205-plugin-branding`（Web 品牌位）。
+- 下游：`108-compliance-release`（签名/版本）、`205-plugin-branding`（Web 品牌位）。

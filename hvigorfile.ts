@@ -10,7 +10,7 @@ import * as path from 'path';
  *   ① 环境变量 CERTPATH / STORE_FILE / PROFILE / KEY_ALIAS / KEY_PASSWORD / STORE_PASSWORD / SIGN_ALG
  *   ② signing.<SIGN_MODE>.local.json（本地、gitignored）
  * 两者都没有 ⇒ 产出未签名包（不报错）；要装机时在 DevEco 为
- * `org.fellow99.dsh.DshDesktopArk` 生成调试签名，或填写 ②。
+ * `top.fellow99.dsh.DshDesktopArk` 生成调试签名，或填写 ②。
  */
 const PROJECT_ROOT = __dirname;
 
