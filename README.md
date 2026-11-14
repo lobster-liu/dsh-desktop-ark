@@ -54,7 +54,7 @@ The complete matrix — every capability, both editions side by side, with root 
 
 ## Status
 
-`0.2.2` (`versionCode` 202) — **built** for dsh-v0.2.2-rc.1 on Node 26.13.0 (on-device verification pending; 0.2.1 device-verified on HarmonyOS 6.1.0.135 / API 24, 2in1): installs with zero ACLs, the payload self-extracts and reports `ready`, all shims install, `node:sqlite`/FTS5 available, text and image conversations, workspace picker across the three roots, git clone (public and intranet), and the branded window (checked through the WebView debugger). Known gaps and their fix points are listed in the capability inventory above.
+`0.2.2` (`versionCode` 202) — **built** for dsh-v0.2.2-rc.3 on Node 26.13.0 (on-device verification pending; 0.2.1 device-verified on HarmonyOS 6.1.0.135 / API 24, 2in1): installs with zero ACLs, the payload self-extracts and reports `ready`, all shims install, `node:sqlite`/FTS5 available, text and image conversations, workspace picker across the three roots, git clone (public and intranet), and the branded window (checked through the WebView debugger). Known gaps and their fix points are listed in the capability inventory above.
 
 ## Build
 
