@@ -120,7 +120,7 @@ RUNNING → STOPPING → STOPPED
 ```jsonc
 {
   "schema": 1,
-  "app": { "bundleName": "org.fellow99.dsh.DshDesktopArk", "versionName": "0.1.0", "versionCode": 100 },
+  "app": { "bundleName": "top.fellow99.dsh.DshDesktopArk", "versionName": "0.1.0", "versionCode": 100 },
   "node": { "expected": "v24.2.0", "abi": 137 },
   "paths": { "filesDir": "…", "resourceDir": "…", "payloadRoot": "…", "dshHome": "…", "workspace": "…" },
   "userDirs": [ { "id": "desktop", "path": "/storage/Users/currentUser/Desktop", "available": true } ],

@@ -18,7 +18,7 @@
 ## 2. 分层
 
 ```
-┌─ HAP（org.fellow99.dsh.DshDesktopArk）────────────────────────────────────┐
+┌─ HAP（top.fellow99.dsh.DshDesktopArk）────────────────────────────────────┐
 │                                                                          │
 │  ┌─ entry（ArkTS）─────────────────────────────────────────────────────┐ │
 │  │ EntryAbility        UIAbility 生命周期；onPrepareToTerminate 不拦截    │ │

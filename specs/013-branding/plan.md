@@ -107,5 +107,5 @@
 
 ## 9. r2 修订（包名）
 
-- `AppScope/app.json5` bundleName 由 `org.fellow99.dsh.DshDesktopArk` 改为 `top.fellow99.dsh.DshDesktopArk`（仅域名前缀 org→top）。
+- `AppScope/app.json5` bundleName 现为 `top.fellow99.dsh.DshDesktopArk`。
 - 源代码无 hardcode bundleName（ArkWeb 壳按需随系统上下文获取）；仅同步 `hvigorfile.ts` 签名注释。

@@ -70,7 +70,7 @@
 |---|---|---|---|
 | T-204-060 | 构 HAP（debug） | `bash scripts/build-hap.sh --debug` | `BUILD SUCCESSFUL` |
 | T-204-061 | 装机 | `hdc install -r <hap>`（带 `-t <目标>`） | Success |
-| T-204-062 | **清设备 `payload` 解压 marker**（否则继续跑旧产物）→ 启动 | `aa start -a EntryAbility -b org.fellow99.dsh.DshDesktopArk` | `ready.json` `phase=ready` |
+| T-204-062 | **清设备 `payload` 解压 marker**（否则继续跑旧产物）→ 启动 | `aa start -a EntryAbility -b top.fellow99.dsh.DshDesktopArk` | `ready.json` `phase=ready` |
 | T-204-063 | 基础功能：设置 API Key → 创建工作区 → 一次对话 | 见 `test-cases.md` TC-204-D1…D3 | 三项通过 |
 | T-204-064 | 无账号仓库全链 | TC-204-A1…A8 | 逐项结论（含预期失败项） |
 | T-204-065 | 带账号仓库读写链 | TC-204-C1…C5 | 逐项结论；只推测试分支 |

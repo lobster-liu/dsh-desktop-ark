@@ -10,7 +10,7 @@
 |---|---|
 | 构建系统 | hvigor 6.1.1.280（CLT）+ ohpm；`buildModeSet` 为 `debug` / `release` |
 | SDK | `compatibleSdkVersion 5.0.5(17)`、`targetSdkVersion 6.1.1(24)`；`minAPIVersion 17`、`targetAPIVersion 24` |
-| 应用标识 | `org.fellow99.dsh.DshDesktopArk`，版本名 `0.1.0`，版本号 `100`（= 0×10000 + 1×100 + 0） |
+| 应用标识 | `top.fellow99.dsh.DshDesktopArk`，版本名 `0.1.0`，版本号 `100`（= 0×10000 + 1×100 + 0） |
 | 形态 | `deviceTypes: ["2in1","tablet"]`；`launchType: singleton`；`backgroundModes: ["taskKeeping"]` |
 | 原生库 | `compressNativeLibs: true` + `extractNativeLibs: true`（module 级，写进 build-profile 会被 schema 拒绝） |
 | 签名 | `signingConfigs: []`（入库为空）+ `hvigorfile.ts` 运行时注入；无材料则产出未签名包 |
@@ -57,7 +57,7 @@
 ## 4. 数据模型
 ```jsonc
 // AppIdentity（AppScope/app.json5）
-{ "bundleName": "org.fellow99.dsh.DshDesktopArk", "vendor": "fellow99",
+{ "bundleName": "top.fellow99.dsh.DshDesktopArk", "vendor": "fellow99",
   "versionCode": 100, "versionName": "0.1.0", "minAPIVersion": 17, "targetAPIVersion": 24 }
 
 // PermissionEntry（module.json5 → 归一化视图）

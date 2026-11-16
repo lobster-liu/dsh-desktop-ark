@@ -37,7 +37,7 @@
 ## B. 真机
 
 ### TC-119-006 compat HAP 安装与启动
-- 步骤：`hdc install -r entry-default-signed.hap`；`hdc shell aa start -a EntryAbility -b org.fellow99.dsh.DshDesktopArk`
+- 步骤：`hdc install -r entry-default-signed.hap`；`hdc shell aa start -a EntryAbility -b top.fellow99.dsh.DshDesktopArk`
 - 期望：安装成功；应用进入 `RUNNING`；`node.log` 的 `argv` 中 `--jitless` 位于脚本路径之前；无 `Cpp Crash`
 - 证据：`hdc shell cat .../payload/{node.log,ready.json}`、`hilog`
 
@@ -57,7 +57,7 @@
 - 证据：`node.log`、`ready.json`
 
 ### TC-119-010 权限面复核
-- 步骤：`unzip -p … module.json | grep -c '"name": "ohos.permission'`（条数）；`unzip -p … module.json | grep -c ALLOW_WRITABLE_CODE_MEMORY`；`hdc shell "atm dump -t -b org.fellow99.dsh.DshDesktopArk" | grep -A1 -E "DOCUMENTS|DOWNLOAD|SCREEN_CAPTURE|WRITABLE"`
+- 步骤：`unzip -p … module.json | grep -c '"name": "ohos.permission'`（条数）；`unzip -p … module.json | grep -c ALLOW_WRITABLE_CODE_MEMORY`；`hdc shell "atm dump -t -b top.fellow99.dsh.DshDesktopArk" | grep -A1 -E "DOCUMENTS|DOWNLOAD|SCREEN_CAPTURE|WRITABLE"`
 - 期望（compat 变体）：声明面 **20 项**（R4 全量对齐参考工程）、`ALLOW_WRITABLE_CODE_MEMORY` **0 处**；`atm dump` 中 `DOCUMENTS`/`DOWNLOAD`/`SCREEN_CAPTURE` **在册但 `grantStatus=-1`**（`user_grant` 未授予），`WRITABLE` **整项不存在**
 - 证据：HAP `module.json` + dump 输出
 

@@ -1,4 +1,4 @@
-# ACL 与权限配置（`org.fellow99.dsh.DshDesktopArk`）
+# ACL 与权限配置（`top.fellow99.dsh.DshDesktopArk`）
 
 > **落点**：`entry/src/main/module.json5`（单模块应用，声明面集中在 entry）。
 > **口径**：判定规则与 `dsh-desktop-hos/docs/ACL申请清单-v2.md` §2 一致（同一台设备、同一套 SDK 权限目录）。
@@ -112,7 +112,7 @@
 
 ### 4.1 Profile 是授权面，声明面不等于授权面
 
-DevEco 自动签名为 `org.fellow99.dsh.DshDesktopArk` 生成的调试 Profile（`~/.ohos/config/default_dsh-desktop-ark_*.p7b`）
+DevEco 自动签名为 `top.fellow99.dsh.DshDesktopArk` 生成的调试 Profile（`~/.ohos/config/default_dsh-desktop-ark_*.p7b`）
 解出来的形状（`openssl smime -verify -inform DER -in … -noverify`）：
 
 **2026-10-21 重签后（当前，零 ACL）**：
@@ -175,7 +175,7 @@ DevEco 自动签名为 `org.fellow99.dsh.DshDesktopArk` 生成的调试 Profile�
 2. 把材料写进 gitignored 的 `signing.debug.local.json`（字段见该文件名旁的 `hvigorfile.ts` 注释），**不要**把绝对路径/口令提交进 `build-profile.json5`；
 3. `bash scripts/build-hap.sh` → `hdc install -r entry/build/default/outputs/default/entry-default-signed.hap`；
    **能装上**即说明 Profile 授权面覆盖了声明面（撤销的 4 项若仍留在 Profile 里，属于多余授权，不影响装机）；
-4. `hdc shell aa start -a EntryAbility -b org.fellow99.dsh.DshDesktopArk`；
+4. `hdc shell aa start -a EntryAbility -b top.fellow99.dsh.DshDesktopArk`；
 5. `hdc shell cat .../files/payload/ready.json` 看 `phase`，`hdc shell cat .../files/payload/app.log` 看垫片与权限日志；
 6. 若出现 SIGTRAP（`Cpp Crash` + 崩溃栈含 `libnode_bridge.so`）⇒ JIT ACL 丢了：核对 Profile 里是否仍有 `ALLOW_WRITABLE_CODE_MEMORY`。
 
@@ -191,8 +191,8 @@ DevEco 自动签名为 `org.fellow99.dsh.DshDesktopArk` 生成的调试 Profile�
 I accesstoken_service/ATM: [GetSelfPermissionsState]Bundle com.huawei.hmos.security.privacycenter,
                              uiExAbility PermissionGrantAbility, serExAbility PermissionServiceGrantAbility, callerPid 7156.
 I accesstoken_service/ATM: [GetSelfPermissionState]ohos.permission.READ_WRITE_DOWNLOAD_DIRECTORY: status: -1, flag: 2
-I org.fellow99.dsh.DshDesktopArk/ATM: [IsDynamicRequest]Permission: ohos.permission.READ_WRITE_DOWNLOAD_DIRECTORY: state: -1, errorReason: 0
-I org.fellow99.dsh.DshDesktopArk/ATM: [RequestPermissionsFromUserExecute]It does not need to request permission
+I top.fellow99.dsh.DshDesktopArk/ATM: [IsDynamicRequest]Permission: ohos.permission.READ_WRITE_DOWNLOAD_DIRECTORY: state: -1, errorReason: 0
+I top.fellow99.dsh.DshDesktopArk/ATM: [RequestPermissionsFromUserExecute]It does not need to request permission
 ```
 
 ⇒ `requestPermissionsFromUser()` 立即返回，`authResults: []`、`permissions: []`。**没有弹窗，也没有授予。**
@@ -235,10 +235,10 @@ I org.fellow99.dsh.DshDesktopArk/ATM: [RequestPermissionsFromUserExecute]It does
 
 ```bash
 # 1) 看当前状态（status=-1 / flag=2 就是矛盾态）
-hdc shell "atm dump -t -b org.fellow99.dsh.DshDesktopArk" | grep -A2 DOCUMENTS_DIRECTORY
+hdc shell "atm dump -t -b top.fellow99.dsh.DshDesktopArk" | grep -A2 DOCUMENTS_DIRECTORY
 
 # 2) 复位该应用的 user_grant 状态（flag 回到 0）
-hdc shell "atm perm -r -b org.fellow99.dsh.DshDesktopArk"      # → Success
+hdc shell "atm perm -r -b top.fellow99.dsh.DshDesktopArk"      # → Success
 
 # 3) 再点「请求权限」（或经路由 POST /_ohos/picker/permission/request）
 #    ⇒ 系统授权对话框真的出现：「允许"DSH Desktop"访问你的"文档"文件夹？」
@@ -246,7 +246,7 @@ hdc shell "uitest dumpLayout -p /data/local/tmp/layout.json"   # 读到 不允�
 hdc shell "uitest uiInput click 1742 1116"                     # 点「允许」
 
 # 4) 复验
-hdc shell "atm dump -t -b org.fellow99.dsh.DshDesktopArk" | grep -A2 DOCUMENTS_DIRECTORY  # grantStatus: 0
+hdc shell "atm dump -t -b top.fellow99.dsh.DshDesktopArk" | grep -A2 DOCUMENTS_DIRECTORY  # grantStatus: 0
 ```
 
 之后 `browse`/`list` 立刻能列出真实目录（`DevEcoStudioProjects` / `JianyingPro` / `pi203-documents`）。
@@ -357,9 +357,9 @@ ACL 只决定**内存权限**，不影响原生库与载荷：`libnode.so`（120
 unzip -p entry/build/default/outputs/default/entry-default-signed.hap module.json | grep -c ALLOW_WRITABLE_CODE_MEMORY   # → 0
 unzip -p entry/build/default/outputs/default/entry-default-signed.hap module.json | grep -c '"name": "ohos.permission'   # → 20
 # 2) 设备授权面：三项用户授权项在册但未授予（grantStatus=-1），JIT 整项不存在
-hdc shell "atm dump -t -b org.fellow99.dsh.DshDesktopArk" | grep -A1 -E "WRITABLE|DOCUMENTS|DOWNLOAD|SCREEN_CAPTURE"
+hdc shell "atm dump -t -b top.fellow99.dsh.DshDesktopArk" | grep -A1 -E "WRITABLE|DOCUMENTS|DOWNLOAD|SCREEN_CAPTURE"
 # 3) 运行形态事实
-hdc shell cat /data/app/el2/100/base/org.fellow99.dsh.DshDesktopArk/haps/entry/files/payload/ready.json
+hdc shell cat /data/app/el2/100/base/top.fellow99.dsh.DshDesktopArk/haps/entry/files/payload/ready.json
 #    → compat.active=true, webAssembly=undefined, fetch=installed, selfcheck.status=ok
 ```
 
