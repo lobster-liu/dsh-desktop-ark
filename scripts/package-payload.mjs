@@ -11,6 +11,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSy
 import { join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { applyFlockShim, applySharpShim, applyAttachmentDurabilityPatch, syncOhosPackages } from './lib/payload-shims.mjs';
+import { patchPayloadLogin } from './lib/payload-login.mjs';
 import { gzipSync } from 'node:zlib';
 
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
@@ -35,6 +36,9 @@ try {
   applyFlockShim(STAGE, (line) => console.log(`[package-payload] ${line}`));
   applySharpShim(STAGE, (line) => console.log(`[package-payload] ${line}`));
   applyAttachmentDurabilityPatch(STAGE, (line) => console.log(`[package-payload] ${line}`));
+  // 登录：客户端 bundle 的 `{}.DSH_CLIENT_*` 占位必须换成字面量，否则 ui-settings-account
+  // 的 start() 直接抛错、点「登录」一个请求都不发（详见 scripts/lib/payload-login.mjs）。
+  patchPayloadLogin(STAGE, (line) => console.log(`[package-payload] ${line}`));
   // 204-plugin-git：isomorphic-git 闭包是 `collectGitRuntime()` 的产物，只会由装配链路物化；
   // 归档前在这里断言一次，避免「源码同步把生成物删掉」这类静默退化把没有闭包的包发到设备上。
   const gitNested = join(STAGE, 'node_modules/@dsh-ohos/git/node_modules/isomorphic-git/package.json');

@@ -50,14 +50,81 @@ div:has(> [data-slot="conversation.hero.brand.mark"][${HERO_ATTR}], > [data-slot
 const TITLE_PATTERN = /<title>[\s\S]*?<\/title>/i
 
 /**
- * 把页面标题换成产品名。已是目标标题时原样返回（幂等）。
+ * 登录桥接标记：注入脚本里带它，二次注入可短路。
+ */
+export const LOGIN_BRIDGE_MARKER = 'dsh-ohos-login-bridge'
+
+/**
+ * 登录桥接脚本 —— **不注入 `dshDesktop`**，让 `ui-settings-account` 走网页分支。
+ *
+ * 两条分支的差别（`ui-settings-account` 的 `start()`）：
+ *   - 有 `dshDesktop`：只调 `account/startSignIn`，拿到的 `authorizeUrl` 交给**外壳**开窗
+ *     （Electron 的 `openExternal`）。ArkWeb 外壳没有这一步，界面会停在「复制登录链接」。
+ *   - 没有 `dshDesktop`：`BrowserLogin.begin()` 先 `window.open('about:blank', '_blank')`
+ *     占位，随后 `popup.location.replace(authorizeUrl)` 把授权页导航进那个标签页。
+ *
+ * ArkWeb 没有系统标签栏，`window.open` 在非用户手势/跨进程场景下返回 null，登录随即
+ * 失败（「操作未完成，请重试」）。这里把 `window.open` 换成**同页导航垫片**：占位返回
+ * 一个假 popup 对象，它的 `location.replace/assign/href` 统统把地址落到当前窗口；
+ * 当前窗口的 `onLoadIntercept` 判定 `https://` 为外链并交给系统浏览器打开，平台跳回的
+ * `http://127.0.0.1:<port>/oauth/callback` 与 Host 同机，回调直达 Host 完成登录。
+ *
+ * 只桥接这一处：垫片不改变「外链一律出系统浏览器」的既有围栏，也不替上游伪造别的能力。
+ */
+const LOGIN_BRIDGE_SCRIPT = `<script>/* ${LOGIN_BRIDGE_MARKER} */(function(){
+  if (globalThis.__dshOhosLoginBridge) return;
+  globalThis.__dshOhosLoginBridge = true;
+  const navigate = (url) => {
+    const target = String(url == null ? '' : url);
+    if (target === '' || target === 'about:blank') return;
+    try { location.href = target } catch (error) {}
+  };
+  const makePopup = () => ({
+    closed: false,
+    opener: null,
+    focus() {},
+    blur() {},
+    close() { this.closed = true },
+    location: {
+      replace: navigate,
+      assign: navigate,
+      get href() { return 'about:blank' },
+      set href(url) { navigate(url) },
+    },
+  });
+  window.open = function () { return makePopup() };
+  globalThis.__DSH_TRANSPORT__ = globalThis.__DSH_TRANSPORT__ || { streamBaseUrl: location.origin };
+})();</script>`
+
+/**
+ * 把页面标题换成产品名，并注入登录桥接。已是目标状态时原样返回（幂等）。
  * @param {string} html - 上游返回的 index.html 文本。
  * @returns {string} 替换后的文本；模板里没有 `<title>` 时原样返回。
  */
 export function replacePageTitle(html) {
   const replacement = `<title>${PRODUCT_TITLE}</title>`
-  if (html.includes(replacement)) return html
-  return TITLE_PATTERN.test(html) ? html.replace(TITLE_PATTERN, replacement) : html
+  const withTitle = html.includes(replacement)
+    ? html
+    : TITLE_PATTERN.test(html) ? html.replace(TITLE_PATTERN, replacement) : html
+  return withLoginBridge(withTitle)
+}
+
+/**
+ * 在 `</head>` 前注入登录桥接脚本。
+ *
+ * 必须在页面脚本之前执行：`ui-settings-account` 在插件装载时就决定走哪条登录分支，
+ * 并读取 `window.open`。内联 `<script>` 放在 `</head>` 前，早于所有 `type="module"` 入口。
+ *
+ * `__DSH_TRANSPORT__.streamBaseUrl` 取当前页 origin：本产品 Host 与页面同源
+ * （`http://127.0.0.1:<port>`），登录回调要回到这个 origin 才能命中 `/oauth/callback`。
+ *
+ * @param {string} html - 含 `<head>` 的页面文本。
+ * @returns {string} 注入后的文本；已有标记或没有 `<head>` 时原样返回。
+ */
+export function withLoginBridge(html) {
+  if (html.includes(LOGIN_BRIDGE_MARKER)) return html
+  const headEnd = /<\/head>/i
+  return headEnd.test(html) ? html.replace(headEnd, `${LOGIN_BRIDGE_SCRIPT}</head>`) : `${LOGIN_BRIDGE_SCRIPT}${html}`
 }
 
 /**
