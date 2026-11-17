@@ -310,7 +310,7 @@ function fakeReq(method, body) {
   }
 }
 
-await test('routes: 注册 6 条；未授权请求被 connection 拒绝', async () => {
+await test('routes: 注册 7 条；未授权请求被 connection 拒绝', async () => {
   const picker2 = new picker.OhosDirectoryPicker(fakeCtx(), config)
   const ctx = routeCtx(undefined)
   picker.registerPickerRoutes(ctx, picker2)
@@ -320,6 +320,7 @@ await test('routes: 注册 6 条；未授权请求被 connection 拒绝', async 
     '/_ohos/picker/list',
     '/_ohos/picker/permission',
     '/_ohos/picker/permission/request',
+    '/_ohos/picker/pick-folder',
     '/_ohos/picker/roots',
   ])
 

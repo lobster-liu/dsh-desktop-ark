@@ -39,6 +39,24 @@ interface PickFilesResult {
   cancelled: boolean;
 }
 
+/** `fs.pickFolder` 的单个结果：uri、映射出的真实路径、是否可读。 */
+interface FolderProbe {
+  uri: string;
+  mapped: string;
+  /** 映射路径可读（`fs.accessSync`）。libnode 只认路径，这个才是工作区能不能用的判据。 */
+  pathReadable: boolean;
+  /** 映射路径里能列出的条目数（-1 表示列不出来）。 */
+  pathEntries: number;
+  pathError?: string;
+}
+
+interface PickFolderResult {
+  ok: boolean;
+  cancelled: boolean;
+  probes: FolderProbe[];
+  error?: string;
+}
+
 /** `image.normalize` 入参（与 `packages/attachment-image-ohos` 的调用面一致） */
 interface ImageNormalizeArgs {
   data?: string;
@@ -162,9 +180,10 @@ export class HostCapabilities {
     host.register('image.normalize', (args: string): Promise<string> => HostCapabilities.normalizeImage(context, args));
     // 系统文件选择器（手机形态下「文档/下载」目录授权被平台白名单挡住时的唯一可行入口）。
     host.register('fs.pickFiles', (args: string): Promise<string> => HostCapabilities.pickFiles(context, args));
+    // 目录选择：手机形态能否选中「文档」下的某个文件夹并直接当工作区用，见 pickFolder 注释。
+    host.register('fs.pickFolder', (args: string): Promise<string> => HostCapabilities.pickFolder(context, args));
 
     // 已注册但未实现：显式返回 not-implemented（宪法 C2）。
-    HostCapabilities.notImplemented(host, 'fs.pickFolder', 'workspace-picker 将经 directoryPicker seam 提供；本轮请用 browse 后端');
     HostCapabilities.notImplemented(host, 'fs.saveFile', '导出将在 P2 提供');
     HostCapabilities.notImplemented(host, 'notify.show', '通知桥将在 P2 接入 NotificationKit');
     HostCapabilities.notImplemented(host, 'clipboard.readImage', '剪贴板图片将在 P2 接入 pasteboard');
@@ -536,6 +555,86 @@ export class HostCapabilities {
       }
       return HostCapabilities.internal('fs.pickFiles', error);
     }
+  }
+
+  /**
+   * 目录选择（实验）：验证手机形态能否用「安全访问」选中一个**文件夹**并把它当工作区。
+   *
+   * 要回答两件事：① 系统选择器在 phone 上是否真的支持 `DocumentSelectMode.FOLDER`
+   * （`@ohos.file.picker.d.ts` 的注释写着 *Only 2-in-1 devices are supported*，但本机
+   * `/system/etc/syscap.json` 里确实带 `...UserFileService.FolderSelection`）；
+   * ② 选中后 Node 侧能不能用**真实路径**读到它（picker 给的是 `file://docs/...` URI，
+   * 而 libnode 只认路径）。所以把 uri、映射出的路径、以及两种读法的探测结果一起回传。
+   */
+  private static async pickFolder(context: common.UIAbilityContext, _args: string): Promise<string> {
+    const probes: FolderProbe[] = [];
+    try {
+      const options: picker.DocumentSelectOptions = new picker.DocumentSelectOptions();
+      options.maxSelectNumber = 1;
+      options.selectMode = picker.DocumentSelectMode.FOLDER;
+      const documentPicker: picker.DocumentViewPicker = new picker.DocumentViewPicker(context);
+      HostCapabilities.log('fs.pickFolder：打开目录选择器');
+      const uris: string[] = await documentPicker.select(options);
+      for (let i = 0; i < uris.length; i++) {
+        probes.push(HostCapabilities.probeFolder(uris[i]));
+      }
+      const result: PickFolderResult = { ok: true, cancelled: uris.length === 0, probes: probes };
+      return JSON.stringify(result);
+    } catch (error) {
+      const message: string = error instanceof Error ? error.message : String(error);
+      const code: number = (error as BusinessError).code;
+      if (code === 13900020 || code === 13900042 || message.indexOf('cancel') >= 0 || message.indexOf('Cancel') >= 0) {
+        const cancelled: PickFolderResult = { ok: true, cancelled: true, probes: probes };
+        return JSON.stringify(cancelled);
+      }
+      const failed: PickFolderResult = {
+        ok: false,
+        cancelled: false,
+        probes: probes,
+        error: 'code=' + code + ' ' + message,
+      };
+      return JSON.stringify(failed);
+    }
+  }
+
+  /**
+   * 把一个目录 uri 映射成 libnode 认的真实路径，并确认它可读。
+   *
+   * 为什么只探读不探写：手机上的「安全访问」给的是**只读**授予（建目录可以，落文件、删文件
+   * 一律 `Permission denied`，实测见 docs/ACL配置.md §8），所以这里不再往用户目录里写探针文件。
+   */
+  private static probeFolder(uri: string): FolderProbe {
+    const probe: FolderProbe = {
+      uri: uri,
+      mapped: HostCapabilities.uriToPath(uri),
+      pathReadable: false,
+      pathEntries: -1,
+    };
+    try {
+      probe.pathReadable = fs.accessSync(probe.mapped);
+    } catch (error) {
+      probe.pathError = error instanceof Error ? error.message : String(error);
+    }
+    try {
+      // libnode 只认路径，所以真正要紧的是「映射出的路径能不能当普通目录用」。
+      const names: string[] = fs.listFileSync(probe.mapped);
+      probe.pathEntries = names.length;
+    } catch (error) {
+      probe.pathError = (probe.pathError ?? '') + ' | list: ' + (error instanceof Error ? error.message : String(error));
+    }
+    return probe;
+  }
+
+  /** `file://docs/storage/Users/currentUser/Documents/x` → `/storage/Users/currentUser/Documents/x`。 */
+  private static uriToPath(uri: string): string {
+    const marker: string = 'file://docs';
+    if (uri.indexOf(marker) === 0) {
+      return uri.substring(marker.length);
+    }
+    if (uri.indexOf('file://') === 0) {
+      return uri.substring('file://'.length);
+    }
+    return uri;
   }
 
   /** URI 末段作为文件名（去掉 query / 百分号编码）。 */

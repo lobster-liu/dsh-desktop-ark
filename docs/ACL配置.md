@@ -430,6 +430,60 @@ W [SPC][PermissionDialog][Model]: terminate session with result, resultCode: 0, 
 
 ---
 
+## 8. 手机形态：目录选择器可用，但授予是**只读**（2026-11-17，Pura X Max / API 26）
+
+§7 说「手机没有目录选择」是**照 SDK 注释的推断，实测不成立**。`@ohos.file.picker.d.ts` 给
+`DocumentSelectMode.FOLDER` 标了 `Only 2-in-1 devices are supported`，但本机
+`/system/etc/syscap.json` 里带 `SystemCapability.FileManagement.UserFileService.FolderSelection`，
+真机点下去确实弹出了系统「选择路径」：我的手机 / 兼容应用数据 / Huawei Share / Download /
+Documents / Books / MyNote / Pictures…，右上角还有「新建文件夹」。
+
+**选中之后拿到什么**（宿主探针 `fs.pickFolder`，见 `HostCapabilities.ets`）：
+
+| 项 | 结果 |
+|---|---|
+| 返回 uri | `file://docs/storage/Users/currentUser/HO_DATA_EXT_MISC/Documents` |
+| 映射路径 | `/storage/Users/currentUser/HO_DATA_EXT_MISC/Documents`（`file://docs/` → `/`） |
+| 按路径读 | `fs.accessSync` **true**，`fs.listFileSync` 能列出条目 |
+| 按 uri 读 | **false** —— `No such file or directory`（`file://docs/...` 只在选择器 API 里认） |
+| 按路径建**目录** | 成功（留下过 `.dsh-write-probe`） |
+| 按路径建**文件** | **`Permission denied`** |
+| 按 uri 写文件 | **`No such file or directory. Open failed`** |
+| 子目录里建文件 | **`Permission denied`**（`dsh-ws/` 内同样被拒） |
+| 删文件 / 删目录 | **`Permission denied`** |
+
+即手机上的「安全访问」给的是**只读授予（外加建目录这一个动作）**。这足以当**只读工作区**
+（读代码、读文档、让模型看资料），但不足以当读写工作区。
+
+**实现（只读工作区）**：
+
+1. 宿主能力 `fs.pickFolder`（`HostCapabilities.ets`）：`selectMode = FOLDER`、`maxSelectNumber = 1`，
+   回 `{ ok, cancelled, probes: [{ uri, mapped, pathReadable, uriReadable, entries, ... }] }`；
+   取消（`13900020` / `13900042`）按 `cancelled: true` 处理，不当失败。
+2. 路由 `POST /_ohos/picker/pick-folder`（`packages/workspace-picker-ohos/lib/routes.js`）：
+   透传探针结果，并把**可读**的选中目录登记为「额外根」（`lib/granted-roots.js`）。
+3. 围栏放宽：`OhosDirectoryPicker.allRoots()` = 固定根 + 已登记根，`list` / `createDirectory`
+   都按它判越界（`lib/index.js`）。**为什么必须登记**：系统给的是真实路径
+   `…/HO_DATA_EXT_MISC/Documents`，而固定根由 `DSH_OHOS_USER_ROOT` 拼成 `…/Documents`，
+   两者指向同一处但字符串不同，不登记就会被围栏判成 `outside the allowed roots (root fence)`。
+4. 客户端：「文档 / 下载」授权门里多一个「选择文件夹（只读）」按钮
+   （`packages/workspace-picker-client-ohos/lib/client.js`），选中后直接把映射路径交给
+   `onPicked()`，并把该目录挂成工作区；按钮旁写明**只读**。
+
+**实测（2026-11-17）**：点「选择文件夹（只读）」→ 系统「选择路径」→ 选 `Documents` → ✓ →
+工作区标题变成 `Documents`，对话界面正常；随后 `POST /_ohos/picker/list`
+`{"path":"/storage/Users/currentUser/HO_DATA_EXT_MISC/Documents"}` 返回
+`ok:true`，条目 `Books / dsh-ws / MyNote`（另有隐藏项 `.dsh-write-probe`），`root: "granted-1"`
+—— Node 侧（libnode 与 ArkTS 同一进程、同一 token）确实读得到。
+
+> 限制与注意事项：
+> ① **只读**：编辑/新建文件会被系统拒绝（`Permission denied`），不要在这种工作区里让 Agent 写文件；
+> ② 授予随本次选择生效，**重启应用后路径可能不再可读**，届时重新选一次；
+> ③ 需要读写请用「沙箱」工作区 + §7 的「从文件导入」；
+> ④ 真·读写外部目录只能走 AppGallery Connect 正规签名/白名单分发，旁加载包做不到。
+
+---
+
 ## 迁移说明（2026-10-22）：ohos-node-bridge → ohpm 中心仓包
 
 > 正文引用的 `ohos-node-bridge` 探针记录与「委托 `tools/provision.mjs` 投放」口径为当时同级 submodule 的历史做法。2026-10-22 起该库已发布为中心仓双包 `@fellow99/node-bridge@0.1.0` + `@fellow99/node-runtime@24.2.0`，运行时经 `ohpm install` 随包分发，本地投放脚本已删除；探针/权限结论本身不受分发方式影响。现行事实源见 `specs/TECH.md` §3 与 `specs/SPECS_CHECKLIST.md`（2026-10-22 闭合块）。

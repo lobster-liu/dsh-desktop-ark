@@ -11,7 +11,7 @@
  * 登录桥接（`window.open` 垫片）不在这里做：它是 `@dsh-ohos/branding` 的源码行为，
  * 由 `syncOhosPackages()` 同步进 payload；本模块只做**断言**，避免两份会漂移的实现。
  */
-import { readFileSync, writeFileSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 
 const ENV = {
@@ -31,14 +31,16 @@ function* walk(dir) {
 }
 
 /**
- * 在 payload 根目录（其下有 `dsh/`）上打常量补丁，并断言登录桥接已在 branding 里。
+ * 在 payload 上打常量补丁，并断言登录桥接已在 branding 里。
  *
- * @param {string} root - payload 根，如 `build/payload-stage`
+ * @param {string} root - payload 根（其下有 `dsh/`），或已经指向 `dsh/` 那一层
  * @param {(line: string) => void} [log]
  * @returns {{ patchedFiles: number, patchedConstants: number }}
  */
 export function patchPayloadLogin(root, log = () => {}) {
-  const modules = join(root, 'dsh', 'node_modules', '@deepseek-ai')
+  const nested = join(root, 'dsh', 'node_modules', '@deepseek-ai')
+  const dshRoot = existsSync(nested) ? join(root, 'dsh') : root
+  const modules = join(dshRoot, 'node_modules', '@deepseek-ai')
   let patchedFiles = 0
   let patchedConstants = 0
   for (const file of walk(modules)) {
@@ -59,7 +61,7 @@ export function patchPayloadLogin(root, log = () => {}) {
   const leftover = [...walk(modules)].filter((file) => readFileSync(file, 'utf8').includes('{}.DSH_CLIENT_'))
   if (leftover.length > 0) throw new Error(`仍有未解析的客户端常量：${leftover.join(', ')}`)
 
-  const brandingPath = join(root, 'dsh', 'node_modules', '@dsh-ohos', 'branding', 'lib', 'index.js')
+  const brandingPath = join(dshRoot, 'node_modules', '@dsh-ohos', 'branding', 'lib', 'index.js')
   if (!readFileSync(brandingPath, 'utf8').includes('dsh-ohos-login-bridge')) {
     throw new Error('branding 里没有登录桥接：先同步 @dsh-ohos/* 源码包（syncOhosPackages）')
   }

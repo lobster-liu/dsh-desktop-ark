@@ -39,6 +39,13 @@ window.__ModuleLoader__.load({
       importHint: '用系统文件选择器把文件拷进「沙箱 / imports」，之后在这里选中沙箱作为工作区即可。',
       importing: '等待选择…',
       importCancelled: '已取消导入。',
+      pickFolder: '选择文件夹（只读）',
+      pickingFolder: '等待选择…',
+      pickFolderCancelled: '已取消选择文件夹。',
+      pickFolderHint: '手机上的「安全访问」只能授予**只读**目录：选中后可以浏览与阅读，写入会被系统拒绝。需要读写请用「沙箱」工作区 + 「从文件导入」。',
+      pickFolderUnreadable: '选中的文件夹不可读（平台未真正授予访问权）。请换一个文件夹试试。',
+      pickFolderDone: '已把只读目录挂为工作区：',
+
     }
 
     const S = {
@@ -153,6 +160,7 @@ window.__ModuleLoader__.load({
       const [error, setError] = React.useState('')
       const [notice, setNotice] = React.useState('')
       const [importing, setImporting] = React.useState(false)
+      const [pickingFolder, setPickingFolder] = React.useState(false)
       const [gate, setGate] = React.useState(null)
       const [creating, setCreating] = React.useState(false)
       const [folderName, setFolderName] = React.useState('')
@@ -311,6 +319,43 @@ window.__ModuleLoader__.load({
         }
       }
 
+      /**
+       * 用系统「安全访问」的目录选择器挂一个**只读**工作区。
+       *
+       * 手机形态下「文档/下载」目录权限是白名单发放（`isSupportDirectoryPG=false`），
+       * 第三方应用申请不到；但目录选择器本身可用，且选中后拿到的真实路径**可读不可写**。
+       * 所以这里把选中目录直接交给上层当工作区，并在提示里讲明只读。
+       */
+      const pickFolderReadOnly = async () => {
+        setPickingFolder(true)
+        setError('')
+        setNotice('')
+        try {
+          const payload = await callRoute('/pick-folder', {}, 600_000)
+          if (!mounted.current) return
+          if (payload.ok !== true) {
+            setError(`${COPY.failed}: ${payload.error ? payload.error : 'unknown'}`)
+            return
+          }
+          if (payload.cancelled === true) {
+            setNotice(COPY.pickFolderCancelled)
+            return
+          }
+          const probe = Array.isArray(payload.probes) ? payload.probes[0] : null
+          const mapped = probe && typeof probe.mapped === 'string' ? probe.mapped : ''
+          if (probe === null || probe.pathReadable !== true || mapped === '') {
+            setNotice(COPY.pickFolderUnreadable)
+            return
+          }
+          setNotice(`${COPY.pickFolderDone}${mapped}`)
+          onPicked(mapped)
+        } catch (failure) {
+          if (mounted.current) setError(`${COPY.failed}: ${failure instanceof Error ? failure.message : String(failure)}`)
+        } finally {
+          if (mounted.current) setPickingFolder(false)
+        }
+      }
+
       const refresh = async () => {
         const root = (await loadRoots()).find((candidate) => candidate.id === tab)
         if (root === undefined) return
@@ -400,6 +445,7 @@ window.__ModuleLoader__.load({
                 gate.reason === 'denied' ? h('div', { style: { marginTop: 6 } }, COPY.permissionDenied) : null,
                 gate.reason === 'invalid' ? h('div', { style: { marginTop: 6 } }, COPY.permissionInvalid) : null,
                 gate.reason === 'invalid' ? h('div', { style: { marginTop: 6, color: '#666' } }, COPY.importHint) : null,
+                gate.reason === 'invalid' ? h('div', { style: { marginTop: 6, color: '#666' } }, COPY.pickFolderHint) : null,
                 gate.reason === 'unknown' ? h('div', { style: { marginTop: 6 } }, COPY.permissionUnknown) : null,
                 gate.reason === 'granted-unreadable' ? h('div', { style: { marginTop: 6 } }, COPY.permissionUnreadable) : null,
                 gate.reason === 'unavailable' ? h('div', { style: { marginTop: 6 } }, COPY.permissionUnavailable) : null,
@@ -411,6 +457,9 @@ window.__ModuleLoader__.load({
                 importing
                   ? h('button', { type: 'button', style: S.btn(false), disabled: true }, COPY.importing)
                   : h('button', { type: 'button', style: S.btn(false), onClick: importFiles }, COPY.importFiles),
+                pickingFolder
+                  ? h('button', { type: 'button', style: S.btn(false), disabled: true }, COPY.pickingFolder)
+                  : h('button', { type: 'button', style: S.btn(false), onClick: pickFolderReadOnly }, COPY.pickFolder),
               ),
             ),
             !loading && gate === null && listing !== null && (listing.entries ?? []).length === 0 &&

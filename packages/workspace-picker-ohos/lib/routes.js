@@ -20,6 +20,7 @@
  */
 
 import { invoke as invokeHost, USER_CHOICE_TIMEOUT_MS } from '@dsh-ohos/host-bridge'
+import { registerGrantedRoot } from './granted-roots.js'
 
 /** 路由前缀（对话框客户端据此调用）。 */
 export const PICKER_ROUTE_PREFIX = '/_ohos/picker'
@@ -307,5 +308,51 @@ export function registerPickerRoutes(ctx, picker) {
         },
       }),
     'workspace-picker: POST import',
+  )
+
+  /**
+   * 只读工作区（`POST /_ohos/picker/pick-folder`）。
+   *
+   * 手机形态下目录权限被平台白名单挡住（见 docs/ACL配置.md §7），但设备 syscap 里带
+   * `SystemCapability.FileManagement.UserFileService.FolderSelection`，系统选择器确实能选
+   * **文件夹**。选中后拿到的是 `file://docs/...` URI，而 libnode 只认路径，所以宿主把 URI
+   * 映射成真实路径并回 `{ ok, cancelled, probes: [{ uri, mapped, pathReadable, pathEntries }] }`。
+   *
+   * 「安全访问」在手机上只给**只读**授予，所以选中的目录按只读工作区挂载：这里把它登记成
+   * 额外根（否则后续 list 会被固定根围栏判成越界），并把结果原样透传给客户端。
+   */
+  ctx.effect(
+    () =>
+      ctx.webServer.register({
+        kind: 'exact',
+        path: `${PICKER_ROUTE_PREFIX}/pick-folder`,
+        handler: async (req, res) => {
+          if (rejected(req, res)) return
+          if (req.method !== 'POST') {
+            sendJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: 'use POST' } })
+            return
+          }
+          try {
+            const reply = await invokeHost('fs.pickFolder', {}, { timeoutMs: USER_CHOICE_TIMEOUT_MS })
+            const payload = reply ?? { ok: false, error: { code: 'pick-failed', message: 'no reply' } }
+            // 选中的目录要登记成额外根，否则后续 list 会被「固定根」围栏判成越界：
+            // 系统给的是真实路径（…/HO_DATA_EXT_MISC/Documents），固定根是 …/Documents。
+            if (payload.ok === true && Array.isArray(payload.probes)) {
+              for (const probe of payload.probes) {
+                if (probe !== null && typeof probe === 'object' && probe.pathReadable === true && typeof probe.mapped === 'string') {
+                  registerGrantedRoot(probe.mapped)
+                }
+              }
+            }
+            sendJson(res, 200, payload)
+          } catch (error) {
+            sendJson(res, 200, {
+              ok: false,
+              error: { code: 'pick-failed', message: error instanceof Error ? error.message : String(error) },
+            })
+          }
+        },
+      }),
+    'workspace-picker: POST pick-folder',
   )
 }

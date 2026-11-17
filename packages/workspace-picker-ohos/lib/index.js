@@ -39,8 +39,10 @@ import { basename, isAbsolute, join, relative, resolve } from 'node:path'
 import { Service } from '@deepseek-ai/cordis'
 import { invoke as invokeHost, USER_CHOICE_TIMEOUT_MS } from '@dsh-ohos/host-bridge'
 import { registerPickerRoutes } from './routes.js'
+import { grantedRootList } from './granted-roots.js'
 
 export { registerPickerRoutes }
+export { registerGrantedRoot, grantedRootList, clearGrantedRoots } from './granted-roots.js'
 
 /**
  * Root ids in the fixed tab order.
@@ -257,7 +259,18 @@ export class OhosDirectoryPicker extends Service {
    * @returns {Array<Record<string, unknown>>}
    */
   rootsDescriptor() {
-    return this.roots.map(root => ({ ...root }))
+    return this.allRoots().map(root => ({ ...root }))
+  }
+
+  /**
+   * 固定根 + 运行期授予的额外根。
+   *
+   * 额外根来自手机「安全访问」的目录选择（真实路径与 `DSH_OHOS_USER_ROOT` 拼出的名字不同，
+   * 只有登记进来才过得了围栏）。这些根是只读的。
+   * @returns {Array<Record<string, any>>}
+   */
+  allRoots() {
+    return this.roots.concat(grantedRootList())
   }
 
   /**
@@ -317,7 +330,7 @@ export class OhosDirectoryPicker extends Service {
   async list(path, signal) {
     if (process.env.DSH_OHOS_PICKER_TRACE === '1') console.log(`[workspace-picker] list(${String(path)})`)
     const raw = path ?? this.roots[0].path
-    const { root, path: target } = fencePath(raw, this.roots)
+    const { root, path: target } = fencePath(raw, this.allRoots())
     signal?.throwIfAborted()
     if (root.id === 'sandbox') {
       try {
@@ -368,7 +381,7 @@ export class OhosDirectoryPicker extends Service {
    */
   async createDirectory(path, name) {
     if (process.env.DSH_OHOS_PICKER_TRACE === '1') console.log(`[workspace-picker] createDirectory(${String(path)}, ${String(name)})`)
-    const { root, path: parent } = fencePath(path, this.roots)
+    const { root, path: parent } = fencePath(path, this.allRoots())
     if (typeof name !== 'string' || name.trim() === '' || name === '.' || name === '..' || /[/\\]/.test(name)) {
       throw new DirectoryPickerError('directory-create-failed', resolve(parent, String(name)), `"${name}" is not a single path segment`)
     }
@@ -450,9 +463,13 @@ export class OhosDirectoryPicker extends Service {
    *   `granted === null` 表示无法判定（宿主桥不可用或目录缺失），调用方不得当作已授权。
    */
   async permission(rootId) {
-    const root = this.roots.find((candidate) => candidate.id === rootId)
+    const root = this.allRoots().find((candidate) => candidate.id === rootId)
     if (root === undefined) {
       return { rootId, granted: null, result: 'unknown-root', detail: `unknown root ${JSON.stringify(rootId)}` }
+    }
+    // 「安全访问」选中的目录：系统已经把访问权给到本次会话，登记即视为已授予（只读）。
+    if (root.readOnly === true) {
+      return { rootId, granted: true, result: 'granted', path: root.path, detail: 'granted by the system folder picker (read-only)' }
     }
     const access = await this.probeAccess(root)
     if (access === 'missing') {
