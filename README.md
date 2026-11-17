@@ -3,12 +3,14 @@
 # DSH Desktop · HarmonyOS Edition
 
 > The **official DeepSeek Harness (dsh) Web UI, unmodified**, running on HarmonyOS 2in1 / tablet inside the system **ArkWeb** — with the dsh Host on a **real Node.js runtime embedded in the same process**. No Electron, no bundled Chromium, no ArkUI rewrite.
+>
+> It also runs on **phones**: 0.2.2 is device-verified on a HUAWEI Pura X Max (`HOP-AL10`, HarmonyOS 7.0.0.111 / **API 26**, `deviceType=phone`) — install, payload, conversations, account sign-in, file import and a read-only folder workspace all work. Phone-specific limits are marked in *Capabilities at a glance* and recorded in [`docs/020-手机形态实测记录.md`](docs/020-手机形态实测记录.md).
 
 <p align="center">
   <img src="https://img.shields.io/badge/release-0.2.2-4D6BFE" alt="Version">
-  <img src="https://img.shields.io/badge/dsh-dsh--v0.2.2--rc.1-7C5CFF" alt="dsh version">
-  <img src="https://img.shields.io/badge/HarmonyOS-API%2024-0A59F7" alt="HarmonyOS API 24">
-  <img src="https://img.shields.io/badge/Node-v26.13.0-5FA04E" alt="Node 24.2.0">
+  <img src="https://img.shields.io/badge/dsh-dsh--v0.2.2--rc.3-7C5CFF" alt="dsh version">
+  <img src="https://img.shields.io/badge/HarmonyOS-API%2024%2B-0A59F7" alt="HarmonyOS API 24+">
+  <img src="https://img.shields.io/badge/Node-v26.13.0-5FA04E" alt="Node 26.13.0">
   <img src="https://img.shields.io/badge/license-MIT-2EA44F" alt="MIT">
 </p>
 
@@ -42,19 +44,23 @@ Neither replaces the other: the Electron edition buys maximum desktop fidelity a
 |---|---|
 | dsh Web UI, sessions, tools, skills, subagents | ✅ works as upstream |
 | File read / write / edit, image attachments | ✅ |
-| Workspace picker with Documents & Downloads (grant → read/write) | ✅ |
+| Workspace picker: sandbox + `Documents` / `Downloads` (grant → read/write) | ✅ on 2in1 / tablet |
+| Workspace from a folder picked in the system picker (phone) | ✅ works, **read-only** — the "safe access" grant does not allow writing files |
+| `Documents` / `Downloads` **direct** directory permission (phone) | ⚠️ platform-whitelisted (hilog: `isSupportDirectoryPG=false`, `configValue=3`); a side-loaded build always gets `authResult=2` — use the read-only folder or *From file* import instead |
 | Git (21 tools, pure JS, no `git` binary needed) | ✅ |
 | Local plugins loaded from the profile, own branding | ✅ |
+| Plugin marketplace (host channel: `dshmarket` + in-process pnpm) | ✅ channel ships; UI not yet device-verified |
+| Installed plugins + pnpm store survive a payload upgrade | ✅ since 0.2.2 ([`docs/pnpm+dsh-market.md`](docs/pnpm+dsh-market.md) §3.7) |
 | Command execution (`bash`) | ⚠️ executor ships; a path-resolution fix is pending |
 | Content search (`grep` / `glob`) | ⚠️ needs a pure-JS backend (no `ripgrep` binary on arm64) |
 | Delete / move / copy / chmod | ⚠️ upstream `ctx.fs` has no such primitives yet |
-| Plugin marketplace, tray icon, window-state memory | — not in this edition |
+| Tray icon, window-state memory, frameless window | — not in this edition |
 
-The complete matrix — every capability, both editions side by side, with root causes — is [`docs/鸿蒙环境能力清单-0.2.1.md`](docs/鸿蒙环境能力清单-0.2.1.md).
+The complete matrix — every capability, both editions side by side, with root causes and fix points — is [`docs/鸿蒙环境能力清单-0.2.1.md`](docs/鸿蒙环境能力清单-0.2.1.md).
 
 ## Status
 
-`0.2.2` (`versionCode` 202) — **built** for dsh-v0.2.2-rc.3 on Node 26.13.0 (on-device verification pending; 0.2.1 device-verified on HarmonyOS 6.1.0.135 / API 24, 2in1): installs with zero ACLs, the payload self-extracts and reports `ready`, all shims install, `node:sqlite`/FTS5 available, text and image conversations, workspace picker across the three roots, git clone (public and intranet), and the branded window (checked through the WebView debugger). Known gaps and their fix points are listed in the capability inventory above.
+`0.2.2` (`versionCode` 202) — **built** for dsh-v0.2.2-rc.3 on Node 26.13.0. Device-verified on **two forms**: `0.2.1` on HarmonyOS 6.1.0.135 / API 24 (2in1) and `0.2.2` on a **HUAWEI Pura X Max (`HOP-AL10`, HarmonyOS 7.0.0.111 / API 26, `deviceType=phone`)**. On the phone: installs with zero ACLs, the payload self-extracts and reports `ready`, all shims install, `node:sqlite`/FTS5 available, text and image conversations, workspace picker with sandbox + *From file* import, a **read-only workspace from the system folder picker**, account login (browser-based, via the login bridge), plugin install/uninstall through the marketplace, and **installed plugins survive a payload upgrade** (see [`docs/pnpm+dsh-market.md`](docs/pnpm+dsh-market.md) §3.7). Known gaps and their fix points are listed in the capability inventory above.
 
 ## Build
 
@@ -91,6 +97,7 @@ Run `bash scripts/build-hap.sh --debug` to get `entry-default-signed.hap`, which
 | [Capability inventory 0.2.2](docs/鸿蒙环境能力清单-0.2.1.md) | What works, what does not, and how this compares to the Electron edition |
 | [Engineering plan](docs/000-工程规划.md) | Why this architecture, what was rejected, and the shim whitelist |
 | [On-device notes](docs/010-真机调试记录.md) | What broke on the device and how it was diagnosed |
+| [Phone-form test record](docs/020-手机形态实测记录.md) | Running this edition on a phone: `--jitless` self-check, login, read-only folder workspace, measured numbers |
 | [JIT and ACL](docs/ACL配置.md) · [JIT-less decision](docs/119-jitless-方案决策.md) | The two runtime forms and what each costs |
 | [Specifications](specs/README.md) | 14 spec modules (013, 101–108, 110, 119, 202, 204, 205) with plans and gates |
 
