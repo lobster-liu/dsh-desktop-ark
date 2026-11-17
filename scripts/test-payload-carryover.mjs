@@ -19,7 +19,7 @@ import { fileURLToPath } from 'node:url';
 
 const require = createRequire(import.meta.url);
 const HOST = fileURLToPath(new URL('../entry/src/main/resources/resfile/dsh-payload/host.js', import.meta.url));
-const { carryOverProfile } = require(HOST);
+const { carryOverProfile, configureMarketRuntime } = require(HOST);
 
 let failures = 0;
 function check(name, condition, detail) {
@@ -181,6 +181,33 @@ function logs() {
     log,
   });
   check('5 空载荷不崩', result.carried === false && result.removed.length === 0, JSON.stringify(result));
+  rmSync(box.root, { recursive: true, force: true });
+}
+
+// 6) 沿用旧 profile 之后，pnpm 的安装记录（node_modules/.modules.yaml）还指着上一代的 store
+//    → configureMarketRuntime 必须把它对齐，否则插件市场里任何安装/更新都 ERR_PNPM_UNEXPECTED_STORE。
+{
+  const box = sandbox();
+  const oldDir = box.make(sha('7'), { deps: { 'dsh-cost-meter': '1.9.70' }, modules: ['dsh-cost-meter'], lock: true });
+  const stale = join(oldDir, '.pnpm-store', 'v10');
+  writeFileSync(join(oldDir, 'node_modules', '.modules.yaml'), `hoistPattern:\n  - '*'\nstoreDir: ${stale}\n`);
+  const newSha = sha('8');
+  const newDir = box.make(newSha, {});
+  const { lines, log } = logs();
+  carryOverProfile({ payloadRoot: box.payloadRoot, profileDir: newDir, currentSha12: newSha, storeDir: box.storeDir, log });
+  configureMarketRuntime({ runRoot: box.root, profileDir: newDir, storeDir: box.storeDir, log });
+  const modules = readFileSync(join(newDir, 'node_modules', '.modules.yaml'), 'utf8');
+  const expected = join(box.storeDir, 'v10');
+  check('6 .modules.yaml storeDir 对齐到新 store', modules.includes(`storeDir: ${expected}`), modules);
+  check('6 保留文件里的其它键', modules.includes('hoistPattern'), modules);
+  check('6 有修正日志', lines.some((line) => line.includes('.modules.yaml storeDir 修正为')), lines.join(' | '));
+  check('6 没有残留旧代次路径', !modules.includes(sha('7')), modules);
+
+  // 幂等：第二次跑不该再改，也不该报错。
+  const second = logs();
+  configureMarketRuntime({ runRoot: box.root, profileDir: newDir, storeDir: box.storeDir, log: second.log });
+  check('6b 二次运行不再改写', second.lines.every((line) => !line.includes('.modules.yaml')), second.lines.join(' | '));
+  check('6b 文件保持正确', readFileSync(join(newDir, 'node_modules', '.modules.yaml'), 'utf8').includes(`storeDir: ${expected}`));
   rmSync(box.root, { recursive: true, force: true });
 }
 

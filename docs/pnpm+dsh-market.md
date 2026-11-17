@@ -209,7 +209,27 @@ market: storeDir 修正为 /data/storage/el2/base/haps/entry/files/pnpm-store（
 
 升级后 `files/pnpm-store` 284MB 仍在、新 profile 的 `package.json` 保留 `dsh-cost-meter 1.9.70` 与 `dsh-our-free-model`（git 源），`node_modules` 仍是 `acorn / dsh-cost-meter / dsh-our-free-model / zod`。
 
-**联调用**：`DSH_PAYLOAD_STAMP=<x> node scripts/package-payload.mjs --force` 会在载荷根写 `PAYLOAD-STAMP`，使 sha12 变化，从而在设备上真实走一遍换载荷流程；不设则不写，构建仍可复现（同输入同 hash）。离线冒烟：`node scripts/test-payload-carryover.mjs`（5 组场景：沿用/不覆盖/只迁 store/keepPrevious/空载荷）。
+**联调用**：`DSH_PAYLOAD_STAMP=<x> node scripts/package-payload.mjs --force` 会在载荷根写 `PAYLOAD-STAMP`，使 sha12 变化，从而在设备上真实走一遍换载荷流程；不设则不写，构建仍可复现（同输入同 hash）。离线冒烟：`node scripts/test-payload-carryover.mjs`（6 组场景：沿用/不覆盖/只迁 store/keepPrevious/空载荷/`storeDir` 指针自愈）。
+
+#### 3.7.1 store 指针自愈（`node_modules/.modules.yaml`）
+
+沿用 profile 只搬了文件，**pnpm 判断「store 在哪儿」读的不是 `pnpm-workspace.yaml`，而是它自己写下的 `node_modules/.modules.yaml`**。这条记录仍然指向上一个载荷代次里的 `.pnpm-store/v10`，而该目录已随升级删除，于是插件市场里**任何**安装/更新/卸载都失败：
+
+```
+ERR_PNPM_UNEXPECTED_STORE  Unexpected store location
+The dependencies at ".../node_modules" are currently linked from the store at ".../669c848c026c/…/.pnpm-store/v10"
+but pnpm now uses the store at ".../files/pnpm-store/v10" instead
+```
+
+真机时间线（2026-11-17，Pura X Max）：19:13 装 `dsh-cost-meter@1.9.70` 成功 → 换载荷 `ca2ff78fdea3` → 21:33 起 `DSH-better-sidebar` 安装、`dsh-cost-meter` 更新到 1.9.72、卸载、`harmony-next.skills` 安装，**每一条都是同一个 `ERR_PNPM_UNEXPECTED_STORE`**（最后一条 22:15）。改 `pnpm-workspace.yaml` 是无效方向——它本来就是对的（`storeDir: ".../files/pnpm-store"`，不带 `/v10`，pnpm 自己拼版本子目录）。
+
+修复：`configureMarketRuntime()` 每次启动都会调 `repairModulesStoreDir()`：读 `<profile>/node_modules/.modules.yaml`，把 `storeDir:` 一行改写成 `join(<storeDir>, <原值的 vNN 后缀>)`，其余键原样保留，幂等；文件不存在（还没装过插件）则什么都不做。
+
+```
+market: node_modules/.modules.yaml storeDir 修正为 /data/storage/el2/base/haps/entry/files/pnpm-store/v10（原值 …/payload/669c848c026c/dsh/profiles/ohos/.pnpm-store/v10）
+```
+
+修完后再点「更新」`dsh-cost-meter` → 1.9.72：`update-start … exit=0 → succeeded`，`profile/package.json` 与 `node_modules/dsh-cost-meter/package.json` 都是 1.9.72（插件需退出重开应用才加载——宿主不支持在线重放）。
 
 ---
 

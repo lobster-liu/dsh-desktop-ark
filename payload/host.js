@@ -27,6 +27,52 @@ const { createRequire } = require('node:module');
  *   writeReady: (payload: object) => void
  * }} ctx
  */
+/** pnpm 的 store 版本子目录名，例如 `.pnpm-store/v10` 里的 `v10`（两种分隔符都要认：开发机是 `\`）。 */
+const STORE_VERSION_RE = /[\\/](v\d+)$/;
+
+/**
+ * 把 `node_modules/.modules.yaml` 里的 `storeDir` 对齐到本次的 store。
+ *
+ * 为什么必须做：pnpm 不读 `pnpm-workspace.yaml` 判断 store 位置，它读自己写下的这条安装记录。
+ * 沿用了上一代 profile 之后，这条记录仍然指向上一个载荷代次里的 `.pnpm-store/v10`，
+ * 而那个目录已经随升级被删除，于是插件市场里**任何**安装/更新/卸载都失败于
+ * `ERR_PNPM_UNEXPECTED_STORE`（真机 2026-11-17 复现：19:13 还能装，21:33 起全挂）。
+ * 只改 `pnpm-workspace.yaml` 是无效方向，改这条记录才对。
+ *
+ * 只重写 `storeDir` 一行，其余原样保留；文件不存在（还没装过插件）时什么都不做。
+ *
+ * @param {string} file - `<profile>/node_modules/.modules.yaml`
+ * @param {string} storeDir - 本次生效的 store 根（不带版本子目录）
+ * @param {(line: string) => void} log
+ * @returns {boolean} 是否真的改写了
+ */
+function repairModulesStoreDir(file, storeDir, log) {
+  let text;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch (error) {
+    return false;
+  }
+  const match = /^storeDir:[ \t]*(.+)$/m.exec(text);
+  if (match === null) {
+    return false;
+  }
+  const current = match[1].trim().replace(/^["']|["']$/g, '');
+  const version = STORE_VERSION_RE.exec(current);
+  const target = version === null ? storeDir : path.join(storeDir, version[1]);
+  if (current === target || current === storeDir) {
+    return false;
+  }
+  try {
+    fs.writeFileSync(file, text.replace(match[0], `storeDir: ${target}`));
+    log(`market: node_modules/.modules.yaml storeDir 修正为 ${target}（原值 ${current}）`);
+    return true;
+  } catch (error) {
+    log(`market: cannot rewrite ${file} (continuing): ${error && error.message ? error.message : String(error)}`);
+    return false;
+  }
+}
+
 /**
  * 110-pnpm-integration / 201-dsh-market：把进程内 pnpm 的运行时前提准备好。
  *
@@ -89,6 +135,9 @@ function configureMarketRuntime(options) {
   } catch (error) {
     log(`market: pnpm config unavailable (continuing): ${error && error.message ? error.message : String(error)}`);
   }
+
+  // 210-profile-carryover 的后半：沿用旧 profile 之后，pnpm 的安装记录还指着上一代的 store。
+  repairModulesStoreDir(path.join(profileDir, 'node_modules', '.modules.yaml'), storeDir, log);
 
   for (const dir of [storeDir, path.join(profileDir, '.pnpm-cache')]) {
     try {
@@ -381,4 +430,4 @@ async function start(ctx) {
   }
 }
 
-module.exports = { start, carryOverProfile, configureMarketRuntime };
+module.exports = { start, carryOverProfile, configureMarketRuntime, repairModulesStoreDir };
