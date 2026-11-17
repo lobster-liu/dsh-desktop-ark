@@ -6,7 +6,9 @@
     "mainElement": "EntryAbility",
     "deviceTypes": [
       "2in1",
-      "tablet"
+      "tablet",
+      // phone：本机实验（Pura X Max / API 26）需要手机形态可装；上游仅声明 2in1/tablet。
+      "phone"
     ],
     "deliveryWithInstall": true,
     "installationFree": false,
