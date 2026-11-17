@@ -50,6 +50,9 @@ export const TOYBOX = '/system/bin/toybox'
 /** Default `PATH` handed to children: system binaries only. */
 export const DEFAULT_PATH = `${SYSTEM_BIN_ROOT}:/system/xbin:/usr/bin:/bin`
 
+/** Roots whose binaries are executable from the app domain (and may be un-stat-able). */
+const SYSTEM_BIN_ROOTS = [SYSTEM_BIN_ROOT, '/system/xbin', '/usr/bin', '/bin']
+
 /** Credential-shaped environment names are never inherited from the parent. */
 export const SENSITIVE_ENV_PATTERN = /KEY|PASSWORD|SECRET|TOKEN/i
 
@@ -201,17 +204,54 @@ export function isAllowedExecutable(path, workspace = workspaceRoot()) {
   return isPathUnder(canonical, workspace)
 }
 
+/**
+ * True when `path` names a platform binary the app domain may execute.
+ *
+ * These are the only locations `isAllowedExecutable` accepts besides the
+ * workspace, and they are also the ones the app domain cannot always `stat(2)`
+ * or `access(2)` (see `assertExecutable`).
+ * @param {string} path
+ * @returns {boolean}
+ */
+export function isSystemBinary(path) {
+  if (typeof path !== 'string' || !isAbsolute(path)) return false
+  for (const root of SYSTEM_BIN_ROOTS) {
+    if (path === root || path.startsWith(`${root}/`)) return true
+  }
+  return false
+}
+
 function assertExecutable(path, command) {
   try {
     const stat = statSync(path)
     if (!stat.isFile()) throw new Error('not a regular file')
     accessSync(path, fsConstants.X_OK)
   } catch (error) {
+    // OHOS 应用域对 /system/bin 下的系统二进制常常连 stat/access 都不允许
+    // （EACCES：SELinux 只放行执行，不放行读/查元数据），但内核仍允许 spawn。
+    // 前置校验在这里会给出"does not resolve to an executable file"的假结论，
+    // 掩盖真正的 spawn 结果（真机上 bash 工具因此完全不可用）。
+    // 系统根下的路径不做前置校验，直接交给 spawn 报真实 errno。
+    if (isSystemBinary(path)) {
+      warnSystemBinaryFallback(path, error)
+      return
+    }
     throw new SubprocessExecutableNotFoundError(
       `subprocess-ohos: "${command}" does not resolve to an executable file inside the allowed roots (${path})`,
       { cause: error },
     )
   }
+}
+
+/** @type {Set<string>} */
+const warnedFallbacks = new Set()
+
+function warnSystemBinaryFallback(path, error) {
+  if (warnedFallbacks.has(path)) return
+  warnedFallbacks.add(path)
+  const reason = error instanceof Error ? `${error.name}: ${error.message}` : String(error)
+  // node.log 里留痕：真机上这是判断"是校验挡住了，还是内核真的不许执行"的依据。
+  console.warn(`subprocess-ohos: skip stat/access for system binary ${path} (${reason}); will let spawn decide`)
 }
 
 /**
@@ -250,8 +290,10 @@ export function resolveProgram(command, env, signal) {
     try {
       accessSync(candidate, fsConstants.X_OK)
       exists = true
-    } catch {
-      exists = false
+    } catch (error) {
+      // 同上：系统二进制可能 stat/access 不通，但仍可执行。
+      exists = isSystemBinary(candidate)
+      if (exists) warnSystemBinaryFallback(candidate, error)
     }
     if (!exists) continue
     if (!isAllowedExecutable(candidate, workspace)) continue
