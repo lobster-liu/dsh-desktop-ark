@@ -50,6 +50,16 @@ interface ReadyInfo {
 }
 
 /**
+ * 公告读取结果：`adopted` 为真表示这一帧是**上一轮**留下的公告，但它的 Host
+ * 仍在本进程里活着（探活通过）。页面重建（UIAbility 重入、ArkWeb 渲染进程重启）
+ * 时 `node::Start` 不可再跑，唯一正确的做法是接管仍在跑的 Host。
+ */
+interface ReadyOutcome {
+  info: ReadyInfo;
+  adopted: boolean;
+}
+
+/**
  * 启动编排：准备目录 → 投递 Node → 等待就绪 → 回读 ready.json → 探活 → 交给页面。
  *
  * 关键事实（评审 #1）：库的 `waitUntilRunning` 以原生 `isRunning` 为判据，
@@ -151,10 +161,15 @@ export class DshRuntime {
       await runtime.waitUntilRunning(Constants.START_TIMEOUT_MS);
 
       this.enter(LaunchPhase.PROBING, '正在确认服务可达…');
-      const ready: ReadyInfo | null = await DshRuntime.waitReady(context, launchedAt);
-      if (ready === null) {
+      const outcome: ReadyOutcome | null = await DshRuntime.waitReady(context, launchedAt);
+      if (outcome === null) {
         this.fail(runtime, `未在预算内读到有效公告：${Constants.readyPath(context)}`);
         return;
+      }
+      const ready: ReadyInfo = outcome.info;
+      if (outcome.adopted) {
+        // 页面重建但 Host 还在：沿用它的端口与 token，不再等新的公告。
+        this.log(`adopt running host ${ready.origin ?? ready.url ?? ''}（公告来自上一轮启动）`);
       }
       if (ready.schema !== 1) {
         this.fail(runtime, `公告 schema 非法（${String(ready.schema)}）`);
@@ -220,16 +235,31 @@ export class DshRuntime {
 
   /**
    * 有界等待公告进入终态（ready / failed / payload-missing）。
-   * 只接受 `at >= notBefore` 的公告，避免读到上一轮的残留（旧端口/旧 token）。
+   *
+   * 新公告（`at >= notBefore`）直接接受。**旧公告只要能探活也接受**：`node::Start`
+   * 每进程只能跑一次，页面重建时不会有新公告，若这里死守新鲜度就会把一个好端端
+   * 在跑的 Host 判成"启动失败"（2026-11-17 真机复现：20:23 重建页面 → 19:41 的
+   * 公告被判过期 → 界面停在 FAILED，而 34241 端口一直活着）。
+   * 旧公告且探不通才继续等——那种情况才是真正的上一轮残留（旧进程已死）。
    */
-  private static async waitReady(context: common.UIAbilityContext, notBefore: number): Promise<ReadyInfo | null> {
+  private static async waitReady(context: common.UIAbilityContext, notBefore: number): Promise<ReadyOutcome | null> {
     const path: string = Constants.readyPath(context);
     for (let i = 0; i < Constants.READY_RETRIES; i++) {
       const info: ReadyInfo | null = DshRuntime.readReady(path);
       if (info !== null) {
-        const fresh: boolean = info.at === undefined || info.at >= notBefore;
-        if (fresh && (info.phase === 'ready' || info.phase === 'failed' || info.phase === 'payload-missing')) {
-          return info;
+        const terminal: boolean =
+          info.phase === 'ready' || info.phase === 'failed' || info.phase === 'payload-missing';
+        if (terminal) {
+          const fresh: boolean = info.at === undefined || info.at >= notBefore;
+          if (fresh) {
+            return { info, adopted: false };
+          }
+          if (info.phase === 'ready' && info.origin !== undefined && info.origin !== '') {
+            const alive: boolean = await Probe.waitFor(info.origin, 1, 0);
+            if (alive) {
+              return { info, adopted: true };
+            }
+          }
         }
       }
       await DshRuntime.delay(Constants.READY_INTERVAL_MS);
