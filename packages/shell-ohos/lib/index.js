@@ -31,6 +31,9 @@ import { tmpdir } from 'node:os'
 import { Service } from '@deepseek-ai/cordis'
 import { TailCollector, readerOf } from './output.js'
 import { buildScript, FrameParser } from './framing.js'
+import { runJsCommand } from './js-shell.js'
+
+export { runJsCommand }
 
 export { buildScript, FrameParser, quoteForPosixShell, BEGIN_PREFIX, END_PREFIX, CD_FAILED } from './framing.js'
 
@@ -125,6 +128,12 @@ export class OhosShellExecutor extends Service {
     /** Serialization queue: one command at a time on the shared shell. */
     this.queue = Promise.resolve()
     this.disposed = false
+    /** `undefined` = not probed yet; `native` = real `/system/bin/sh`; `js` = builtin interpreter. */
+    this.engine = undefined
+    const forced = process.env.DSH_OHOS_SHELL_MODE
+    if (forced === 'js' || forced === 'native') this.engine = forced
+    /** Set once the builtin-shell notice has been emitted. */
+    this.engineNoticeSent = false
     ctx.effect(() => () => this.dispose(), 'shell-ohos teardown')
   }
 
@@ -347,11 +356,99 @@ export class OhosShellExecutor extends Service {
     if (exec.settled) return
     exec.armDeadline()
     try {
-      if (spec.stdin !== undefined) await this.runOneShot(exec)
+      const engine = this.engine ?? (await this.resolveEngine())
+      if (engine === 'js') await this.runJs(exec)
+      else if (spec.stdin !== undefined) await this.runOneShot(exec)
       else await this.runPersistent(exec)
     } catch (error) {
       exec.fail(error)
     }
+  }
+
+  /**
+   * Decide once whether this device can start a real `/system/bin/sh`.
+   *
+   * Phone builds cannot: the app domain has no search permission on
+   * `system_file`, so even `stat('/system/bin/sh')` fails with `EACCES` and
+   * `execve` does too. The builtin JS interpreter then runs the command in
+   * process instead of failing every call.
+   * @returns {Promise<'native' | 'js'>}
+   */
+  async resolveEngine() {
+    const forced = process.env.DSH_OHOS_SHELL_MODE
+    if (forced === 'js' || forced === 'native') {
+      this.engine = forced
+      return forced
+    }
+    if (this.engine !== undefined) return this.engine
+    const available = await this.probeNative()
+    this.engine = available ? 'native' : 'js'
+    if (!available) {
+      this.ctx.logger?.info?.('shell-ohos: /system/bin/sh unusable on this device; falling back to the builtin JS shell')
+    }
+    return this.engine
+  }
+
+  /**
+   * Try one trivial spawn to see whether a native shell can start at all.
+   * @returns {Promise<boolean>}
+   */
+  async probeNative() {
+    const workspace = workspaceRoot()
+    if (workspace === undefined) return false
+    let handle
+    try {
+      handle = this.ctx.subprocess.spawn({
+        argv: [this.config.shellPath, '-c', 'exit 0'],
+        cwd: workspace,
+        stdio: { stdin: 'ignore', stdout: { maxBytes: 1024 }, stderr: { maxBytes: 1024 } },
+        graceMs: 2_000,
+      })
+    } catch {
+      return false
+    }
+    try {
+      const outcome = await Promise.race([
+        handle.done.then(result => result?.exitCode === 0, () => false),
+        new Promise(resolve => setTimeout(() => resolve('timeout'), 1_500)),
+      ])
+      // A shell that neither exits nor fails within the probe window is treated
+      // as usable: a real refusal (EACCES from execve) arrives in milliseconds.
+      return outcome === 'timeout' ? true : outcome === true
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * Run one command with the builtin interpreter (no child process).
+   * @param {Record<string, any>} exec
+   * @returns {Promise<void>}
+   */
+  async runJs(exec) {
+    const { spec } = exec
+    if (!this.engineNoticeSent) {
+      this.engineNoticeSent = true
+      exec.stderr.push(
+        Buffer.from(
+          `${this.config.shellPath} cannot start on this device (EACCES: the app domain may not execute system binaries); `
+            + 'running the command with the builtin JS shell instead — pipelines, redirects and file commands work, '
+            + 'but no external binary (git, tar, rg, curl, bun …) can run.\n',
+          'utf8',
+        ),
+      )
+    }
+    const outcome = await runJsCommand(spec.command, {
+      cwd: spec.workdir,
+      env: this.envFor(spec),
+      stdin: spec.stdin,
+      maxBytes: spec.stdoutMaxBytes,
+      isCancelled: () => exec.settled,
+    })
+    if (exec.settled) return
+    if (outcome.stdout !== '') exec.stdout.push(Buffer.from(outcome.stdout, 'utf8'))
+    if (outcome.stderr !== '') exec.stderr.push(Buffer.from(outcome.stderr, 'utf8'))
+    exec.settle(outcome.exitCode, null)
   }
 
   /**
@@ -436,6 +533,7 @@ export class OhosShellExecutor extends Service {
     const onGone = error => {
       this.shellDead = true
       if (this.shell === handle) this.shell = undefined
+      if (error !== undefined && /EACCES|ENOENT|EPERM/.test(String(error?.message ?? ''))) this.engine = 'js'
       const current = this.current
       if (current !== undefined && !current.settled) {
         current.fail(error ?? new Error('shell-ohos: the persistent shell exited before the command finished'))

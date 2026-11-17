@@ -51,7 +51,7 @@
 | profile 内的本地插件、本产品品牌位 | ✅ |
 | 插件市场（宿主通道：`dshmarket` + 进程内 pnpm） | ✅ 通道随包；UI 真机验收待补 |
 | 升级后保留已装插件与 pnpm store | ✅ 0.2.2 起（[`docs/pnpm+dsh-market.md`](docs/pnpm+dsh-market.md) §3.7） |
-| 命令执行（`bash`） | ⚠️ 执行器已交付，路径解析修复待落地 |
+| 命令执行（`bash`） | ✅ 手机上走**内置 JS shell**（`echo/ls/cat/grep/find/cp/mv/rm/管道/重定向/node` 等），外部二进制（`git`/`tar`/`rg`/`curl`/`bun`）不可用——应用域无法 `exec` |
 | 内容搜索（`grep` / `glob`） | ⚠️ 需要纯 JS 后端（arm64 上没有 `ripgrep` 二进制） |
 | 删除 / 移动 / 复制 / chmod | ⚠️ 上游 `ctx.fs` 尚无这些原语 |
 | 托盘图标、窗口状态记忆、无边框窗口 | — 本版不提供 |

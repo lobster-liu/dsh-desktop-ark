@@ -11,7 +11,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { registerHooks } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -31,6 +31,9 @@ const framing = await import('../lib/framing.js')
 
 const workspace = mkdtempSync(join(tmpdir(), 'dsh-ohos-shell-'))
 process.env.DSH_OHOS_WORKSPACE = workspace
+// The cases below exercise the native framing protocol against a fake shell, so
+// the engine is pinned to `native` and the availability probe is skipped.
+process.env.DSH_OHOS_SHELL_MODE = 'native'
 
 let failures = 0
 async function test(name, fn) {
@@ -236,6 +239,21 @@ await test('execute(): kill() is idempotent and settles without a timeout flag',
   assert.equal(result.aborted, false)
   assert.equal(result.signal, 'SIGTERM')
   assert.equal(subprocess.spawned[0].terminated, true)
+})
+
+await test('execute(): the builtin JS shell runs commands when no process can start', async () => {
+  const { executor, subprocess } = executorWith(() => undefined, { timeoutMs: 5_000 })
+  executor.engine = 'js'
+  const posixWorkspace = workspace.replaceAll('\\', '/')
+  writeFileSync(join(workspace, 'note.txt'), 'alpha\n')
+  const proc = await executor.execute(
+    executor.resolve({ command: 'cat note.txt && echo done', workdir: posixWorkspace }),
+  )
+  const result = await proc.result()
+  assert.equal(result.exitCode, 0)
+  assert.equal(result.stdout.text, 'alpha\ndone\n')
+  assert.match(result.stderr.text, /builtin JS shell/)
+  assert.equal(subprocess.spawned.length, 0, 'the builtin shell starts no child process')
 })
 
 rmSync(workspace, { recursive: true, force: true })

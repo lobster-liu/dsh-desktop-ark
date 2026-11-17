@@ -51,7 +51,7 @@ Neither replaces the other: the Electron edition buys maximum desktop fidelity a
 | Local plugins loaded from the profile, own branding | ✅ |
 | Plugin marketplace (host channel: `dshmarket` + in-process pnpm) | ✅ channel ships; UI not yet device-verified |
 | Installed plugins + pnpm store survive a payload upgrade | ✅ since 0.2.2 ([`docs/pnpm+dsh-market.md`](docs/pnpm+dsh-market.md) §3.7) |
-| Command execution (`bash`) | ⚠️ executor ships; a path-resolution fix is pending |
+| Command execution (`bash`) | ✅ on phones it runs a **builtin JS shell** (`echo/ls/cat/grep/find/cp/mv/rm`, pipes, redirects, `node`); external binaries (`git`/`tar`/`rg`/`curl`/`bun`) cannot run — the app domain may not `exec` |
 | Content search (`grep` / `glob`) | ⚠️ needs a pure-JS backend (no `ripgrep` binary on arm64) |
 | Delete / move / copy / chmod | ⚠️ upstream `ctx.fs` has no such primitives yet |
 | Tray icon, window-state memory, frameless window | — not in this edition |
