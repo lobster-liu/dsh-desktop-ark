@@ -478,9 +478,18 @@ Documents / Books / MyNote / Pictures…，右上角还有「新建文件夹」�
 
 > 限制与注意事项：
 > ① **只读**：编辑/新建文件会被系统拒绝（`Permission denied`），不要在这种工作区里让 Agent 写文件；
-> ② 授予随本次选择生效，**重启应用后路径可能不再可读**，届时重新选一次；
+> ② 授予随本次选择生效，**重启应用后路径通常不再可读**；登记表会落盘（见下），所以重启后这个目录
+>    仍认得（不再报「越界」），但打开时提示 *grant expired*，重新选一次即可恢复读权限；
 > ③ 需要读写请用「沙箱」工作区 + §7 的「从文件导入」；
 > ④ 真·读写外部目录只能走 AppGallery Connect 正规签名/白名单分发，旁加载包做不到。
+
+**重启后的行为（2026-11-17 追加）**：登记表落盘到 `<DSH_HOME>/ohos-granted-roots.json`
+（`packages/workspace-picker-ohos/lib/granted-roots.js` 的 `configureGrantedRoots()` /
+`loadGrantedRoots()`：`0600`、写临时文件再 `rename`、坏文件只记日志）。进程启动时
+`OhosDirectoryPicker` 只恢复**位置**，不恢复**权限**——`permission()` 先 `probeAccess()` 现场复核，
+读不动就返回 `result: 'expired'`（不假装已授权）；`list()` 相应抛
+`directory-unreadable` 并带 `grantExpired: true`，文案明确让人重选。单元测试在
+`packages/workspace-picker-ohos/test/smoke.mjs`（「落盘后重启能恢复位置，但权限仍要现场复核」）。
 
 ---
 

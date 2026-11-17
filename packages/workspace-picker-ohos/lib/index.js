@@ -39,10 +39,20 @@ import { basename, isAbsolute, join, relative, resolve } from 'node:path'
 import { Service } from '@deepseek-ai/cordis'
 import { invoke as invokeHost, USER_CHOICE_TIMEOUT_MS } from '@dsh-ohos/host-bridge'
 import { registerPickerRoutes } from './routes.js'
-import { grantedRootList } from './granted-roots.js'
+import { defaultGrantedRootsFile, grantedRootList, loadGrantedRoots } from './granted-roots.js'
 
 export { registerPickerRoutes }
-export { registerGrantedRoot, grantedRootList, clearGrantedRoots } from './granted-roots.js'
+export {
+  registerGrantedRoot,
+  grantedRootList,
+  clearGrantedRoots,
+  loadGrantedRoots,
+  forgetGrantedRoot,
+  configureGrantedRoots,
+  grantedRootsFile,
+  defaultGrantedRootsFile,
+  GRANTED_ROOTS_FILE_NAME,
+} from './granted-roots.js'
 
 /**
  * Root ids in the fixed tab order.
@@ -252,6 +262,20 @@ export class OhosDirectoryPicker extends Service {
     }
     // 启动可见性：诊断「服务是否真的注册了」比猜 RPC 是否挂起更快（见 logs/20261019-1）。
     console.log(`[workspace-picker] registered ctx.directoryPicker roots=${this.roots.map((root) => root.id).join(',')}`)
+    // 恢复上次「安全访问」选过的目录：只恢复“位置”，不恢复“权限”（详见 granted-roots.js）。
+    // `config.persistGrantedRoots === false` 时完全不动盘（单元测试用）；
+    // `config.grantedRootsFile` 可显式指定文件，否则取 `<DSH_HOME>/ohos-granted-roots.json`。
+    if (this.config.persistGrantedRoots !== false) {
+      const storeFile = typeof this.config.grantedRootsFile === 'string'
+        ? this.config.grantedRootsFile
+        : defaultGrantedRootsFile()
+      if (storeFile !== '') {
+        const restored = loadGrantedRoots({ file: storeFile })
+        if (restored.length > 0) {
+          console.log(`[workspace-picker] granted roots restored=${restored.length} file=${storeFile}`)
+        }
+      }
+    }
   }
 
   /**
@@ -357,6 +381,13 @@ export class OhosDirectoryPicker extends Service {
       if (code === 'ENOENT' || code === 'ENOTDIR') failure.missing = true
       if ((code === 'EACCES' || code === 'EPERM') && root.permission !== undefined) failure.permissionRequired = true
       if (root.permission !== undefined) failure.permission = root.permission
+      // 「安全访问」的授予只对授予它的那次运行有效：重启后目录还在、位置也对，但读不动。
+      // 明确区分成「授权过期」而不是「越界/不存在」，界面才知道该提示重新选择。
+      if (root.readOnly === true && (code === 'EACCES' || code === 'EPERM')) {
+        failure.grantExpired = true
+        failure.permissionRequired = false
+        failure.message = `cannot list ${target}: the folder's system grant expired, pick it again to restore read access (${messageOf(error)})`
+      }
       throw failure
     }
     if (!info.isDirectory()) {
@@ -467,9 +498,24 @@ export class OhosDirectoryPicker extends Service {
     if (root === undefined) {
       return { rootId, granted: null, result: 'unknown-root', detail: `unknown root ${JSON.stringify(rootId)}` }
     }
-    // 「安全访问」选中的目录：系统已经把访问权给到本次会话，登记即视为已授予（只读）。
+    // 「安全访问」选中的目录：登记只说明“用户在本次/上次选过它”，权限仍要现场复核。
+    // 系统给的授予通常只对授予它的那次运行有效，重启后目录就可能读不动（实测）。
     if (root.readOnly === true) {
-      return { rootId, granted: true, result: 'granted', path: root.path, detail: 'granted by the system folder picker (read-only)' }
+      const grantedAccess = await this.probeAccess(root)
+      if (grantedAccess === 'readable') {
+        return { rootId, granted: true, result: 'granted', readOnly: true, path: root.path, detail: 'granted by the system folder picker (read-only)' }
+      }
+      if (grantedAccess === 'missing') {
+        return { rootId, granted: null, result: 'missing', readOnly: true, path: root.path, detail: `root path does not exist: ${root.path}` }
+      }
+      return {
+        rootId,
+        granted: false,
+        result: 'expired',
+        readOnly: true,
+        path: root.path,
+        detail: 'the folder was granted by the system picker in an earlier run; pick it again to restore read access',
+      }
     }
     const access = await this.probeAccess(root)
     if (access === 'missing') {

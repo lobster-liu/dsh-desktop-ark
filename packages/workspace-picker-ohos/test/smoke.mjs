@@ -12,10 +12,10 @@
  */
 
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { registerHooks } from 'node:module'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 
 registerHooks({
   resolve(specifier, context, nextResolve) {
@@ -544,6 +544,54 @@ await test('POST import: 透传宿主 fs.pickFiles；取消不算失败，宿主
 
   bridgeState.pickFiles = null
   bridgeState.fail = false
+})
+
+await test('granted roots: 落盘后重启能恢复位置，但权限仍要现场复核', async () => {
+  const grantedDir = mkdtempSync(join(tmpdir(), 'dsh-ohos-granted-'))
+  const storeFile = join(mkdtempSync(join(tmpdir(), 'dsh-ohos-granted-store-')), picker.GRANTED_ROOTS_FILE_NAME)
+
+  picker.configureGrantedRoots({ file: storeFile })
+  const root = picker.registerGrantedRoot(grantedDir)
+  assert.ok(root !== undefined, '登记成功')
+  assert.equal(root.readOnly, true)
+  assert.ok(existsSync(storeFile), '写入了持久化文件')
+  const saved = JSON.parse(readFileSync(storeFile, 'utf8'))
+  assert.equal(saved.roots.length, 1)
+  assert.equal(saved.roots[0].path, resolve(grantedDir))
+
+  // 模拟进程重启：清内存再 load，位置应恢复。
+  picker.clearGrantedRoots({ persist: false })
+  assert.equal(picker.grantedRootList().length, 0)
+  const restored = picker.loadGrantedRoots()
+  assert.equal(restored.length, 1)
+  assert.equal(restored[0].path, resolve(grantedDir))
+  assert.equal(restored[0].readOnly, true)
+
+  // 目录可读时，围栏认它（`kind: 'granted'`），且 `permission()` 报「已授予（只读）」。
+  const readable = await picker.fencePath(resolve(grantedDir), picker.resolveRoots({ sandboxRoot: workspace, userRoot }, process.env).concat(picker.grantedRootList()))
+  assert.equal(readable.root.kind, 'granted')
+
+  const tempService = new picker.OhosDirectoryPicker(fakeCtx(), { sandboxRoot: workspace, userRoot, persistGrantedRoots: false })
+  const grantedState = await tempService.permission(restored[0].id)
+  assert.equal(grantedState.granted, true)
+  assert.equal(grantedState.result, 'granted')
+  assert.equal(grantedState.readOnly, true)
+
+  // 目录不存在时不能假装已授权。
+  const missingRoot = picker.registerGrantedRoot(join(grantedDir, 'not-there'))
+  assert.ok(missingRoot !== undefined)
+  const missingState = await tempService.permission(missingRoot.id)
+  assert.equal(missingState.granted, null)
+  assert.equal(missingState.result, 'missing')
+
+  // 忘了它 → 文件里也清掉。
+  assert.equal(picker.forgetGrantedRoot(missingRoot.id), true)
+  assert.equal(picker.forgetGrantedRoot(missingRoot.id), false)
+  assert.equal(JSON.parse(readFileSync(storeFile, 'utf8')).roots.length, 1)
+
+  picker.clearGrantedRoots({ persist: false })
+  picker.configureGrantedRoots({ file: '' })
+  rmSync(grantedDir, { recursive: true, force: true })
 })
 
 rmSync(workspace, { recursive: true, force: true })
