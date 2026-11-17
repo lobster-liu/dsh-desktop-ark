@@ -35,7 +35,7 @@
 | P4 | 宿主 Node 跑在**进程内 detached 线程**，`node::Start` 每进程一次，不可重启 | `specs/ARCHITECTURE.md` §3 | pnpm 的 `process.exit` 若在主线程调用会**杀掉整个应用** ⇒ 只能在 worker 里跑（§3.4） |
 | P5 | `worker_threads` 的 `Worker` 在设备上存在（库探针 `worker_threads=true`） | `../ohos-node-bridge/docs/001-能力矩阵.md` #7 | 主路线可用；启动即探针取证（§3.6） |
 | P6 | 设备无 `git` 二进制 | `docs/鸿蒙环境能力清单-0.2.1.md` | 市场里 `git:` 源插件不可安装；须在文档披露 |
-| P7 | 载荷按 sha256 前 12 位分代解包：`<filesDir>/payload/<sha12>/dsh` | `payload/bootstrap.js` `resolveRunRoot()` | **profile 在载荷内** ⇒ 装进 profile 的插件属于「本代载荷」，换包即失效（§8 L1） |
+| P7 | 载荷按 sha256 前 12 位分代解包：`<filesDir>/payload/<sha12>/dsh` | `payload/bootstrap.js` `resolveRunRoot()` | **profile 在载荷内** ⇒ 装进 profile 的插件属于「本代载荷」；0.2.2 起由 `carryOverProfile()` 跨代沿用（§3.7），store 迁到 `<files>/pnpm-store` |
 | P8 | 本工程 profile 固定 `<runRoot>/profiles/ohos`，bundle 解析第一锚点是 `<runRoot>/node_modules/@deepseek-ai/dsh/package.json` | `profile.ts:714-725`、`payload/host.js` | dshmarket 物化到 `<runRoot>/node_modules/dshmarket` 即可被命中；**不需要**像 hos 那样复制到 `$DSH_HOME`（§4.9） |
 | P9 | `node:sqlite` 在本工程可用（含 FTS5） | `payload/shims/sqlite.js`、`specs/119-jitless/spec.md` | pnpm 11 的 store 理论上可用；本期仍沿用同源已验收的 pnpm 10（§4.2） |
 | P10 | 运行时形态固定 `compat`（`--jitless`）⇒ `WebAssembly === undefined`，且**每个 realm 各有一份全局** | `payload/jitless/index.js` 头部注释、`docs/119-jitless-方案决策.md` | worker 是**新 realm**，兼容层与垫片必须重装（§3.3）；安装耗时按分钟级预算（R2） |
@@ -173,7 +173,7 @@ pnpm 的 CLI 是 fire-and-forget：`import(entry)` 在安装真正完成前早�
 
 1. `process.env.DSH_OHOS_JITLESS_ENTRY = <assetDir>/jitless/index.js`（`bootstrap.js` 已有 `ASSET_DIR`）。
 2. `process.env.DSH_PNPM_ENGINE = <runRoot>/node_modules/dsh-market-pnpm/bin/pnpm.cjs`（`host.js`）。
-3. `ensureProfilePnpmConfig(profileDir)`：缺 `pnpm-workspace.yaml` 才写（§3.2 内容，`storeDir` 绝对路径）；并 `mkdir` `<profileDir>/.pnpm-store`、`<profileDir>/.pnpm-cache`。
+3. `ensureProfilePnpmConfig(profileDir)`：缺 `pnpm-workspace.yaml` 才写（§3.2 内容，`storeDir` 绝对路径）；并 `mkdir` `<files>/pnpm-store`（0.2.2 起在载荷之外，跨代复用；§3.7）与 `<profileDir>/.pnpm-cache`。
 4. `profileContext` 由 `profileBoot.runProfile({ profile: 'ohos' })` 提供，本层不注入。
 
 **与 hos 的差异（P8）**：本工程**不需要**把 `dshmarket` 复制到 `$DSH_HOME/profiles/node_modules`。bundle 解析第一锚点是 `installAnchor`；client 模块扫描按「row 的模块位置」定位 `package.json`（`packages/client/modules/src/index.ts` `resolveMeta`/`locatePkgJson`），都以载荷为锚点。
@@ -184,6 +184,32 @@ pnpm 的 CLI 是 fire-and-forget：`import(entry)` 在安装真正完成前早�
   `market: desktopProfiles/desktopPnpm provided (profile=ohos dir=… engine=… engineOk=true worker=ok)`。
 - `globalThis.__dshOhosMarket = { profile, profileDir, engineEntry, engineOk, worker, workerError, lastRun: { args, exitCode, at } }`，供 `--inspect`（CDP `Runtime.evaluate`）读回；debug 构建 `INSPECT_PORT=19229`（`BuildConfig.ets`）。
 - 市场自己的日志：`<profileDir>/.dsh-market/log.ndjson`（`event:install` / `hot-mount`）。
+
+### 3.7 升级保留已装插件（210-profile-carryover，0.2.2 起）
+
+**问题**：载荷按 sha12 分代（P7），profile 在载荷内 ⇒ 换包后新 profile 是「随包状态」，用户装过的插件与 pnpm store 全部消失。实测一次升级会丢 `node_modules`（56MB：`dsh-cost-meter`、`dsh-our-free-model`、`acorn`、`zod`）与 `.pnpm-store`（284MB）。
+
+**机制**（`payload/host.js` 的 `carryOverProfile()`，在 `configureMarketRuntime()` **之前**、`runProfile()` 之前执行）：
+
+1. 扫 `payloadRoot` 下**其它** sha12 目录，取「新→旧」排序；排除当前代。
+2. `adoptStore()`：把旧 profile 的 `.pnpm-store` 与当前 profile 的 `.pnpm-store` 都挪到 `<files>/pnpm-store`（同盘 `rename` 瞬时；目标非空则保留目标）；随后 `configureMarketRuntime()` 把 `pnpm-workspace.yaml` 的 `storeDir` 指向它 —— store 从此**跨代复用**，重装插件不必重新下载。
+3. 若当前 profile 还没有插件（`dependencies` 为空且 `node_modules` 无包），而某个旧 profile 有，则按 `CARRY_OVER_ENTRIES = [package.json, pnpm-lock.yaml, pnpm-workspace.yaml, .npmrc, cordis.patch.yml, node_modules, .dsh-market]` 逐项 `cpSync` 过来。`cordis.yml`（静态 `[]`）不搬。
+4. 拷贝成功后删掉旧载荷目录（只是缓存，HAP 里随时能再解一遍）。设 `DSH_OHOS_KEEP_PREVIOUS_PAYLOAD=1` 则保留，便于回滚。
+
+**边界**：只在「`hdc install -r` 覆盖安装」时保留；`uninstall` 会清空 `files/`，连 `dsh-home` 一起丢。全程 try/catch，任一步失败只记日志、Host 照常启动。
+
+**真机证据**（2026-11-17，Pura X Max / `669c848c026c` → `ca2ff78fdea3`）：
+
+```
+profile-carryover: store 迁移 …/payload/669c848c026c/dsh/profiles/ohos/.pnpm-store -> …/files/pnpm-store
+profile-carryover: 沿用 669c848c026c 的 profile（package.json, pnpm-lock.yaml, pnpm-workspace.yaml, .npmrc, cordis.patch.yml, node_modules, .dsh-market）
+profile-carryover: 已清理旧载荷 669c848c026c
+market: storeDir 修正为 /data/storage/el2/base/haps/entry/files/pnpm-store（原值 …669c848c026c/…/.pnpm-store）
+```
+
+升级后 `files/pnpm-store` 284MB 仍在、新 profile 的 `package.json` 保留 `dsh-cost-meter 1.9.70` 与 `dsh-our-free-model`（git 源），`node_modules` 仍是 `acorn / dsh-cost-meter / dsh-our-free-model / zod`。
+
+**联调用**：`DSH_PAYLOAD_STAMP=<x> node scripts/package-payload.mjs --force` 会在载荷根写 `PAYLOAD-STAMP`，使 sha12 变化，从而在设备上真实走一遍换载荷流程；不设则不写，构建仍可复现（同输入同 hash）。离线冒烟：`node scripts/test-payload-carryover.mjs`（5 组场景：沿用/不覆盖/只迁 store/keepPrevious/空载荷）。
 
 ---
 
@@ -196,7 +222,7 @@ pnpm 的 CLI 是 fire-and-forget：`import(entry)` 在安装真正完成前早�
 | 4.3 | 引擎落地目录 | **`node_modules/dsh-market-pnpm`（独立目录）** | 与顶层同名包解耦，避免将来 `dsh plugin` 把 `node_modules/pnpm` 当作自己的工具链 |
 | 4.4 | worker 不可用时 | **同线程执行（沿用原设计）已否决** | 无可判定完成条件（§3.4）；失败闭环比假成功安全 |
 | 4.5 | 契约对接 | **市场内置 `desktopProfiles` / `desktopPnpm`（Route 1）** | 改市场源码（Route 2）否；改上游 dsh 否；`profileContext.packageManager` 走 CLI spawn 否（P1） |
-| 4.6 | profile 位置 | **留在载荷 `<runRoot>/profiles/ohos`** | 迁到 `$DSH_HOME/profiles/ohos` 会改动 loader 解析锚点与 dsh 的 profile 契约，收益（跨代持久化）不抵本期风险；登记 L1 |
+| 4.6 | profile 位置 | **留在载荷 `<runRoot>/profiles/ohos`** | 迁到 `$DSH_HOME/profiles/ohos` 会改动 loader 解析锚点与 dsh 的 profile 契约；跨代持久化改用 §3.7 的「换载荷时沿用旧 profile」实现（L1 已缓解） |
 | 4.7 | 布局与导入法 | **hoisted + copy** | `isolated`（pnpm 默认）建 symlink/hardlink，平台禁止（P3） |
 | 4.8 | lifecycle 脚本 | **`ignoreScripts: true`** | 平台无编译器/无法 spawn；同时是安全属性。代价：市场 UI 的「放行构建脚本并重试」（写 `allowBuilds:`）在本宿主**必然无效**，须在文档披露（R5） |
 | 4.9 | dshmarket 第二份拷贝 | **不需要** | bundle 与 client 扫描都以载荷为锚点（§3.5）；复制只会造两份漂移 |
@@ -315,7 +341,7 @@ bootstrap.js（主线程：异常兜底 → jitless 兼容层 → 垫片 → 解
 | R3 | pnpm 引擎 ≈ 21 MiB + 市场 ≈ 2 MiB | HAP 体积 | 构建期打印增量；prune 非目标平台二进制 |
 | R4 | 市场版本浮动（当前 1.73.14；hos 记 1.66.21 / 1.66.7） | 契约漂移 | 集中常量 + 构建期断言；升级即红 |
 | R5 | `ignoreScripts: true` 使市场的「放行构建脚本并重试」无效 | 用户被引导到死路 | 文档与 UI 文案披露；`git:` 源同样不可装 |
-| R6 | 载荷分代 ⇒ 换包后已装插件消失（L1） | 升级体验 | 登记为已知限制；后续任务：profile 迁 `$DSH_HOME` 或代际接续 |
+| R6 | 载荷分代 ⇒ 换包后已装插件消失（L1） | 升级体验 | **已缓解（0.2.2）**：`carryOverProfile()` 在换载荷时沿用旧 profile 的 `package.json` / `node_modules` / `pnpm-lock` / `.dsh-market`，并把 store 升到 `<files>/pnpm-store`（§3.7）；仅 `uninstall` 重装会丢 |
 | R7 | 安装通道绕过 `fs-sandbox`：pnpm 直接写 profile 目录 | 安全面扩大 | 安装目录由宿主固定为 profile，**不采信**市场传入的 `invokingDir`；`ignoreScripts` 关闭脚本执行 |
 | R8 | 本宿主不能在线重放组合（`node::Start` 一次、ArkWeb 客户端模块图固定），插件装卸一律「重启生效」 | 体验（多一步重启） | 已实现 `pluginActivation` + bundle 对账：装卸即持久化、重启即生效；这是真机上唯一稳定路径 |
 | R9 | 市场的网络层换成纯 JS undici 替身后，`HTTP(S)_PROXY` 不再生效（`EnvHttpProxyAgent` 是空实现） | 需要代理的环境里市场请求直连并失败 | 设备侧不出网代理；如实登记于 `packages/market-ohos/README*.md`；若将来需要代理，在替身里补 CONNECT 隧道 |

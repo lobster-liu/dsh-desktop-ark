@@ -7,7 +7,7 @@
  * - 没有 stage 时**跳过**（scaffold 阶段没有真实载荷），保留已有 `dsh.version`。
  */
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { applyFlockShim, applySharpShim, applyAttachmentDurabilityPatch, syncOhosPackages } from './lib/payload-shims.mjs';
@@ -65,6 +65,20 @@ const builtAtArg = (() => {
   const index = process.argv.indexOf('--built-at');
   return index >= 0 ? process.argv[index + 1] : undefined;
 })();
+
+/**
+ * 210-profile-carryover 联调用：`DSH_PAYLOAD_STAMP=<x>` 会在载荷根留一个标记文件，使这份归档的
+ * sha12 与上一份不同 —— 设备上就能真实走一遍「换载荷 → 沿用旧 profile 的插件」。不设则不写，
+ * 保证正常构建仍然可复现（同输入同 hash）。
+ */
+const stamp = process.env.DSH_PAYLOAD_STAMP;
+const stampFile = join(STAGE, 'PAYLOAD-STAMP');
+if (typeof stamp === 'string' && stamp !== '') {
+  writeFileSync(stampFile, `${stamp}\n`);
+  console.log(`[package-payload] stamp ${stamp}（仅联调用，勿提交到发布构建）`);
+} else {
+  rmSync(stampFile, { force: true });
+}
 
 /**
  * profile 的运行期状态不进归档。

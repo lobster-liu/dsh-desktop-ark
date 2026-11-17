@@ -45,7 +45,11 @@ function configureMarketRuntime(options) {
   process.env.DSH_PNPM_ENGINE = engine;
   log(`market: DSH_PNPM_ENGINE=${engine}`);
 
-  const storeDir = path.join(profileDir, '.pnpm-store');
+  // 210-profile-carryover：store 放在 payload **之外**（`<files>/pnpm-store`），这样换载荷
+  // 不必重新下载 284MB 的包内容；没有传入时退回旧行为（profile 内），保持兼容。
+  const storeDir = typeof options.storeDir === 'string' && options.storeDir !== ''
+    ? options.storeDir
+    : path.join(profileDir, '.pnpm-store');
   const configFile = path.join(profileDir, 'pnpm-workspace.yaml');
   try {
     if (!fs.existsSync(configFile)) {
@@ -95,6 +99,180 @@ function configureMarketRuntime(options) {
   }
 }
 
+/** 载荷目录名就是 sha12。 */
+const PAYLOAD_DIR_RE = /^[0-9a-f]{12}$/;
+
+/**
+ * profile 里属于「用户装出来的东西」的文件：换载荷后必须沿用，否则等于每次升级清空插件。
+ * 只搬这些，不搬 `cordis.yml`（静态 `[]`）与随包分发的其它文件。
+ */
+const CARRY_OVER_ENTRIES = [
+  'package.json',
+  'pnpm-lock.yaml',
+  'pnpm-workspace.yaml',
+  '.npmrc',
+  'cordis.patch.yml',
+  'node_modules',
+  '.dsh-market',
+];
+
+function readJson(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (error) {
+    return undefined;
+  }
+}
+
+/**
+ * 判断一个 profile 是否「已经装过插件」：package.json 里有 dependencies，或 node_modules 里
+ * 有非点开头的包（随机载荷自带的 profile 两者都是空的）。
+ */
+function profileHasUserPlugins(profileDir) {
+  const pkg = readJson(path.join(profileDir, 'package.json'));
+  const deps = pkg && pkg.dependencies && typeof pkg.dependencies === 'object' ? Object.keys(pkg.dependencies) : [];
+  if (deps.length > 0) {
+    return true;
+  }
+  const modules = path.join(profileDir, 'node_modules');
+  try {
+    return fs.readdirSync(modules).some((name) => !name.startsWith('.'));
+  } catch (error) {
+    return false;
+  }
+}
+
+/** 找出 payload 根下所有「旧载荷里的 profile」目录（不含当前 sha12 自己），新的在前。 */
+function previousProfiles(payloadRoot, currentSha12) {
+  let names = [];
+  try {
+    names = fs.readdirSync(payloadRoot);
+  } catch (error) {
+    return [];
+  }
+  const found = [];
+  for (const name of names) {
+    if (!PAYLOAD_DIR_RE.test(name) || name === currentSha12) {
+      continue;
+    }
+    const profileDir = path.join(payloadRoot, name, 'dsh', 'profiles', 'ohos');
+    if (!fs.existsSync(path.join(profileDir, 'package.json'))) {
+      continue;
+    }
+    let mtime = 0;
+    try {
+      mtime = fs.statSync(profileDir).mtimeMs;
+    } catch (error) {
+      mtime = 0;
+    }
+    found.push({ name, profileDir, mtime });
+  }
+  found.sort((left, right) => right.mtime - left.mtime);
+  return found;
+}
+
+/**
+ * 把 pnpm store 挪到 payload 之外（`<files>/pnpm-store`），同盘 rename 是瞬时的。
+ * 目标已经非空时保留目标、不动来源（来源随旧载荷一起删掉即可）。
+ */
+function adoptStore(sourceStore, storeDir, log) {
+  if (!fs.existsSync(sourceStore)) {
+    return false;
+  }
+  try {
+    const existing = fs.existsSync(storeDir) ? fs.readdirSync(storeDir).length : 0;
+    if (existing > 0) {
+      log(`profile-carryover: store 已存在 ${storeDir}（${existing} 项），沿用`);
+      return true;
+    }
+    fs.mkdirSync(path.dirname(storeDir), { recursive: true });
+    try {
+      fs.renameSync(sourceStore, storeDir);
+      log(`profile-carryover: store 迁移 ${sourceStore} -> ${storeDir}`);
+    } catch (error) {
+      fs.cpSync(sourceStore, storeDir, { recursive: true, force: true });
+      log(`profile-carryover: store 复制 ${sourceStore} -> ${storeDir}（rename 失败：${error && error.message ? error.message : String(error)}）`);
+    }
+    return true;
+  } catch (error) {
+    log(`profile-carryover: store 迁移失败（继续）：${error && error.message ? error.message : String(error)}`);
+    return false;
+  }
+}
+
+/**
+ * 210-profile-carryover：换载荷（sha12 变化）后沿用上一份 profile 里装好的插件。
+ *
+ * profile 必须留在运行根内（ESM 从它向上解析 `@dsh-ohos/*`），所以不能把 profile 移出去；
+ * 只能在**新载荷刚解出来**的时候，把旧载荷 profile 里属于用户的那几项拷进来。拷贝成功后旧载荷
+ * 目录整目录删掉（它只是缓存，HAP 里随时能再解一遍），把空间还回去。
+ *
+ * 全程 try/catch：任何一步失败都只记日志，Host 照常启动。
+ *
+ * @param {{ payloadRoot: string, profileDir: string, currentSha12: string, storeDir: string,
+ *   keepPrevious?: boolean, log: (line: string) => void }} options
+ * @returns {{ carried: boolean, from?: string, copied: string[], removed: string[] }}
+ */
+function carryOverProfile(options) {
+  const { payloadRoot, profileDir, currentSha12, storeDir, keepPrevious, log } = options;
+  const result = { carried: false, from: undefined, copied: [], removed: [] };
+  try {
+    const candidates = previousProfiles(payloadRoot, currentSha12);
+    if (candidates.length === 0) {
+      log('profile-carryover: 没有旧载荷，跳过');
+      return result;
+    }
+    // 先把 store 挪出去：即使这一份 profile 已经装过插件，store 也应该升到 payload 之外。
+    adoptStore(path.join(candidates[0].profileDir, '.pnpm-store'), storeDir, log);
+    adoptStore(path.join(profileDir, '.pnpm-store'), storeDir, log);
+
+    const target = candidates.find((candidate) => profileHasUserPlugins(candidate.profileDir));
+    if (target === undefined) {
+      log(`profile-carryover: 旧 profile 里没有装过插件（${candidates.map((c) => c.name).join(', ')}）`);
+    } else if (profileHasUserPlugins(profileDir)) {
+      log('profile-carryover: 新 profile 已经装过插件，跳过拷贝');
+    } else {
+      for (const entry of CARRY_OVER_ENTRIES) {
+        const source = path.join(target.profileDir, entry);
+        if (!fs.existsSync(source)) {
+          continue;
+        }
+        const destination = path.join(profileDir, entry);
+        try {
+          fs.rmSync(destination, { recursive: true, force: true });
+          fs.cpSync(source, destination, { recursive: true, force: true, dereference: false });
+          result.copied.push(entry);
+        } catch (error) {
+          log(`profile-carryover: 拷贝 ${entry} 失败（继续）：${error && error.message ? error.message : String(error)}`);
+        }
+      }
+      result.carried = result.copied.length > 0;
+      result.from = target.name;
+      log(`profile-carryover: 沿用 ${target.name} 的 profile（${result.copied.join(', ') || '无'}）`);
+    }
+
+    if (keepPrevious === true) {
+      log('profile-carryover: keepPrevious 打开，保留旧载荷目录');
+      return result;
+    }
+    for (const candidate of candidates) {
+      const dir = path.join(payloadRoot, candidate.name);
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+        result.removed.push(candidate.name);
+      } catch (error) {
+        log(`profile-carryover: 删除旧载荷 ${candidate.name} 失败（继续）：${error && error.message ? error.message : String(error)}`);
+      }
+    }
+    if (result.removed.length > 0) {
+      log(`profile-carryover: 已清理旧载荷 ${result.removed.join(', ')}`);
+    }
+  } catch (error) {
+    log(`profile-carryover: 失败（继续）：${error && error.message ? error.message : String(error)}`);
+  }
+  return result;
+}
+
 async function start(ctx) {
   const { runRoot, version, shims, sqlite, compat, log, writeReady } = ctx;
   const dshHome = process.env.DSH_HOME || path.join(process.env.HOME || '/', 'dsh-home');
@@ -102,9 +280,22 @@ async function start(ctx) {
   const projectDir = path.join(runRoot, 'profiles', 'ohos');
   const userPatch = path.join(dshHome, 'user-patch.yml');
   const dshManifest = path.join(runRoot, 'node_modules', '@deepseek-ai', 'dsh', 'package.json');
+  // `runRoot` = `<files>/payload/<sha12>/dsh` → payload 根、以及 payload 之外的持久目录。
+  const payloadRoot = path.dirname(path.dirname(runRoot));
+  const storeDir = path.join(path.dirname(payloadRoot), 'pnpm-store');
+  // 210-profile-carryover：换载荷后沿用上一份 profile 装好的插件（并顺手把旧载荷目录删掉）。
+  // 必须在 runProfile 之前：profile 的组合与行配置在 runProfile 内一次性读取。
+  carryOverProfile({
+    payloadRoot,
+    profileDir: projectDir,
+    currentSha12: version.sha12 || path.basename(path.dirname(runRoot)),
+    storeDir,
+    keepPrevious: process.env.DSH_OHOS_KEEP_PREVIOUS_PAYLOAD === '1',
+    log
+  });
   // 012/201：进程内 pnpm 的运行时前提（引擎入口 + profile pnpm 配置）。必须在 runProfile 之前，
   // 因为 profile 的组合与行配置在 runProfile 内一次性读取。
-  configureMarketRuntime({ runRoot, profileDir: projectDir, log });
+  configureMarketRuntime({ runRoot, profileDir: projectDir, storeDir, log });
 
   writeReady({ phase: 'starting', sha12: version.sha12, shims: shims.map((s) => s.marker), compat });
 
@@ -190,4 +381,4 @@ async function start(ctx) {
   }
 }
 
-module.exports = { start };
+module.exports = { start, carryOverProfile, configureMarketRuntime };
