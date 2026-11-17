@@ -310,12 +310,13 @@ function fakeReq(method, body) {
   }
 }
 
-await test('routes: 注册 5 条；未授权请求被 connection 拒绝', async () => {
+await test('routes: 注册 6 条；未授权请求被 connection 拒绝', async () => {
   const picker2 = new picker.OhosDirectoryPicker(fakeCtx(), config)
   const ctx = routeCtx(undefined)
   picker.registerPickerRoutes(ctx, picker2)
   assert.deepEqual([...ctx.routes.keys()].sort(), [
     '/_ohos/picker/create',
+    '/_ohos/picker/import',
     '/_ohos/picker/list',
     '/_ohos/picker/permission',
     '/_ohos/picker/permission/request',
@@ -493,6 +494,55 @@ await test('permission(): 设备没有该目录时报 missing，而不是「未�
   assert.ok(listFailure !== null)
   assert.equal(listFailure.missing, true)
   assert.equal(listFailure.permissionRequired, undefined)
+})
+
+await test('POST import: 透传宿主 fs.pickFiles；取消不算失败，宿主未实现才是失败', async () => {
+  bridgeState.fail = false
+  const service = new picker.OhosDirectoryPicker(fakeCtx(), config)
+  const importCtx = routeCtx(undefined)
+  picker.registerPickerRoutes(importCtx, service)
+
+  bridgeState.pickFiles = {
+    ok: true,
+    dir: join(workspace, 'imports'),
+    cancelled: false,
+    files: [{ name: 'a.pdf', path: join(workspace, 'imports', 'a.pdf'), size: 2939616 }],
+  }
+  const okReq = fakeReq('POST', { maxCount: 5 })
+  const okRes = fakeRes()
+  const okPending = importCtx.routes.get('/_ohos/picker/import')(okReq, okRes)
+  okReq.emitBody()
+  await okPending
+  const okBody = JSON.parse(okRes.body)
+  assert.equal(okBody.ok, true)
+  assert.equal(okBody.cancelled, false)
+  assert.equal(okBody.files[0].name, 'a.pdf')
+  const call = bridgeState.invocations.at(-1)
+  assert.equal(call.name, 'fs.pickFiles')
+  assert.equal(call.args.maxCount, 5)
+
+  bridgeState.pickFiles = { ok: true, dir: join(workspace, 'imports'), cancelled: true, files: [] }
+  const cancelReq = fakeReq('POST', {})
+  const cancelRes = fakeRes()
+  const cancelPending = importCtx.routes.get('/_ohos/picker/import')(cancelReq, cancelRes)
+  cancelReq.emitBody()
+  await cancelPending
+  const cancelBody = JSON.parse(cancelRes.body)
+  assert.equal(cancelBody.ok, true, '用户取消不是错误')
+  assert.equal(cancelBody.cancelled, true)
+
+  bridgeState.pickFiles = null
+  const failReq = fakeReq('POST', {})
+  const failRes = fakeRes()
+  const failPending = importCtx.routes.get('/_ohos/picker/import')(failReq, failRes)
+  failReq.emitBody()
+  await failPending
+  const failBody = JSON.parse(failRes.body)
+  assert.equal(failBody.ok, false)
+  assert.equal(failBody.error.code, 'import-failed')
+
+  bridgeState.pickFiles = null
+  bridgeState.fail = false
 })
 
 rmSync(workspace, { recursive: true, force: true })

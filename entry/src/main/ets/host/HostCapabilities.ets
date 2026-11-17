@@ -1,5 +1,6 @@
+import { BusinessError } from '@kit.BasicServicesKit';
 import { abilityAccessCtrl, bundleManager, common, PermissionRequestResult, Permissions, Want } from '@kit.AbilityKit';
-import { fileIo as fs } from '@kit.CoreFileKit';
+import { fileIo as fs, picker } from '@kit.CoreFileKit';
 import { image } from '@kit.ImageKit';
 import { util } from '@kit.ArkTS';
 import { hilog } from '@kit.PerformanceAnalysisKit';
@@ -17,6 +18,25 @@ interface NamesArgs {
 
 interface UriArgs {
   uri?: string;
+}
+
+/** `fs.pickFiles` 入参：把用户选中的文件**拷贝**进沙箱目录后返回落点。 */
+interface PickFilesArgs {
+  targetDir?: string;
+  maxCount?: number;
+}
+
+interface PickedFile {
+  name: string;
+  path: string;
+  size: number;
+}
+
+interface PickFilesResult {
+  ok: boolean;
+  dir: string;
+  files: PickedFile[];
+  cancelled: boolean;
 }
 
 /** `image.normalize` 入参（与 `packages/attachment-image-ohos` 的调用面一致） */
@@ -140,10 +160,11 @@ export class HostCapabilities {
     host.register('shell.openExternal', (args: string): Promise<string> => HostCapabilities.openExternal(context, args));
     // 图像规范化（S4 的像素后端）：SharpPipeline 的每个像素操作都走这里。
     host.register('image.normalize', (args: string): Promise<string> => HostCapabilities.normalizeImage(context, args));
+    // 系统文件选择器（手机形态下「文档/下载」目录授权被平台白名单挡住时的唯一可行入口）。
+    host.register('fs.pickFiles', (args: string): Promise<string> => HostCapabilities.pickFiles(context, args));
 
     // 已注册但未实现：显式返回 not-implemented（宪法 C2）。
     HostCapabilities.notImplemented(host, 'fs.pickFolder', 'workspace-picker 将经 directoryPicker seam 提供；本轮请用 browse 后端');
-    HostCapabilities.notImplemented(host, 'fs.pickFiles', '附件导入将在 P2 提供；本轮暂用拖拽/粘贴');
     HostCapabilities.notImplemented(host, 'fs.saveFile', '导出将在 P2 提供');
     HostCapabilities.notImplemented(host, 'notify.show', '通知桥将在 P2 接入 NotificationKit');
     HostCapabilities.notImplemented(host, 'clipboard.readImage', '剪贴板图片将在 P2 接入 pasteboard');
@@ -361,10 +382,10 @@ export class HostCapabilities {
   private static capabilities(): CapabilityStatus[] {
     const implemented: string[] = [
       'runtime.facts', 'log.hilog', 'perm.check', 'perm.request', 'perm.openAppInfo', 'shell.openExternal',
-      'image.normalize'
+      'image.normalize', 'fs.pickFiles'
     ];
     const pending: string[] = [
-      'fs.pickFolder', 'fs.pickFiles', 'fs.saveFile', 'notify.show',
+      'fs.pickFolder', 'fs.saveFile', 'notify.show',
       'clipboard.readImage', 'clipboard.writeText', 'power.keepAwake'
     ];
     const result: CapabilityStatus[] = [];
@@ -453,6 +474,103 @@ export class HostCapabilities {
     } catch (error) {
       return HostCapabilities.internal('perm.request', error);
     }
+  }
+
+  /**
+   * 系统文件选择器（`fs.pickFiles`）：用户选中的文件被**拷贝**进 `targetDir`（默认
+   * `<workspace>/imports`），返回落点。
+   *
+   * 存在理由：手机形态下平台只向白名单应用开放「文档/下载」目录授权
+   * （`AuthorizationDialogBase.isSupportDirectoryPG=false`，实测 `authResult=2`），
+   * 而系统文件选择器对第三方应用始终可用 —— 它给的是**单次文件授权**，所以这里落到沙箱里，
+   * 之后 Node 侧读写再无障碍。
+   */
+  private static async pickFiles(context: common.UIAbilityContext, args: string): Promise<string> {
+    let target: string = Constants.workspaceRoot(context) + '/imports';
+    try {
+      const parsed: PickFilesArgs = JSON.parse(args) as PickFilesArgs;
+      if (parsed.targetDir !== undefined && parsed.targetDir !== '') {
+        target = parsed.targetDir;
+      }
+      const max: number = parsed.maxCount !== undefined && parsed.maxCount > 0 ? Math.min(parsed.maxCount, 50) : 20;
+      const options: picker.DocumentSelectOptions = new picker.DocumentSelectOptions();
+      options.maxSelectNumber = max;
+      options.selectMode = picker.DocumentSelectMode.FILE;
+      const documentPicker: picker.DocumentViewPicker = new picker.DocumentViewPicker(context);
+      HostCapabilities.log('fs.pickFiles：打开系统文件选择器 max=' + max);
+      const uris: string[] = await documentPicker.select(options);
+      if (uris.length === 0) {
+        const empty: PickFilesResult = { ok: true, dir: target, files: [], cancelled: true };
+        return JSON.stringify(empty);
+      }
+      if (!fs.accessSync(target)) {
+        fs.mkdirSync(target, true);
+      }
+      const files: PickedFile[] = [];
+      for (let i = 0; i < uris.length; i++) {
+        const uri: string = uris[i];
+        const name: string = HostCapabilities.uniqueName(target, HostCapabilities.baseName(uri));
+        const dest: string = target + '/' + name;
+        const source = fs.openSync(uri, fs.OpenMode.READ_ONLY);
+        try {
+          fs.copyFileSync(source.fd, dest);
+        } finally {
+          fs.closeSync(source);
+        }
+        const stat = fs.statSync(dest);
+        const file: PickedFile = { name: name, path: dest, size: stat.size };
+        files.push(file);
+      }
+      HostCapabilities.log('fs.pickFiles：导入 ' + files.length + ' 个文件 -> ' + target);
+      const payload: PickFilesResult = { ok: true, dir: target, files: files, cancelled: false };
+      return JSON.stringify(payload);
+    } catch (error) {
+      // 用户取消时 picker 抛 BusinessError（13900020 / 13900042，各版本不一）——
+      // 取消不是失败，回 cancelled:true，避免界面弹「导入失败」。
+      const message: string = error instanceof Error ? error.message : String(error);
+      const code: number = (error as BusinessError).code;
+      if (code === 13900020 || code === 13900042 || message.indexOf('cancel') >= 0 || message.indexOf('Cancel') >= 0) {
+        HostCapabilities.log('fs.pickFiles：用户取消');
+        const cancelled: PickFilesResult = { ok: true, dir: target, files: [], cancelled: true };
+        return JSON.stringify(cancelled);
+      }
+      return HostCapabilities.internal('fs.pickFiles', error);
+    }
+  }
+
+  /** URI 末段作为文件名（去掉 query / 百分号编码）。 */
+  private static baseName(uri: string): string {
+    let text: string = uri;
+    const query: number = text.indexOf('?');
+    if (query >= 0) {
+      text = text.substring(0, query);
+    }
+    const slash: number = text.lastIndexOf('/');
+    const raw: string = slash >= 0 ? text.substring(slash + 1) : text;
+    let name: string = raw;
+    try {
+      name = decodeURIComponent(raw);
+    } catch (error) {
+      name = raw;
+    }
+    return name === '' ? 'imported' : name;
+  }
+
+  /** 目标目录里重名时追加 `-1`、`-2`…，绝不覆盖用户已有的文件。 */
+  private static uniqueName(dir: string, name: string): string {
+    if (!fs.accessSync(dir + '/' + name)) {
+      return name;
+    }
+    const dot: number = name.lastIndexOf('.');
+    const stem: string = dot > 0 ? name.substring(0, dot) : name;
+    const ext: string = dot > 0 ? name.substring(dot) : '';
+    for (let i = 1; i < 1000; i++) {
+      const candidate: string = stem + '-' + i + ext;
+      if (!fs.accessSync(dir + '/' + candidate)) {
+        return candidate;
+      }
+    }
+    return stem + '-' + Date.now() + ext;
   }
 
   private static async openAppInfo(context: common.UIAbilityContext): Promise<string> {

@@ -16,7 +16,10 @@
  *   POST /_ohos/picker/create             -> { ok, path }    | { ok:false, error }
  *   POST /_ohos/picker/permission         -> { rootId, permission, granted, detail }
  *   POST /_ohos/picker/permission/request -> { rootId, permission, granted, detail }
+ *   POST /_ohos/picker/import             -> { ok, dir, files, cancelled } | { ok:false, error }
  */
+
+import { invoke as invokeHost, USER_CHOICE_TIMEOUT_MS } from '@dsh-ohos/host-bridge'
 
 /** 路由前缀（对话框客户端据此调用）。 */
 export const PICKER_ROUTE_PREFIX = '/_ohos/picker'
@@ -245,5 +248,64 @@ export function registerPickerRoutes(ctx, picker) {
         },
       }),
     'workspace-picker: POST permission/request',
+  )
+
+  /**
+   * 用**系统文件选择器**把手机上的文件导入沙箱工作区。
+   *
+   * 为什么需要它：手机形态下平台只向白名单应用开放「文档/下载」目录授权
+   * （系统日志 `isSupportDirectoryPG=false` ⇒ `authResult=2`），任何第三方应用都申请不到
+   * 目录权限；而文件选择器给的是单次文件授权，且对所有应用可用。选中后由 ArkTS 侧
+   * （`fs.pickFiles`）把文件拷贝进沙箱，之后 Node 侧读写不再需要任何权限。
+   */
+  ctx.effect(
+    () =>
+      ctx.webServer.register({
+        kind: 'exact',
+        path: `${PICKER_ROUTE_PREFIX}/import`,
+        handler: async (req, res) => {
+          if (rejected(req, res)) return
+          if (req.method !== 'POST') {
+            sendJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: 'use POST' } })
+            return
+          }
+          const body = await readJsonBody(req)
+          if (body === null) {
+            sendJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'body must be a JSON object' } })
+            return
+          }
+          const args = {}
+          if (typeof body.targetDir === 'string' && body.targetDir !== '') args.targetDir = body.targetDir
+          if (typeof body.maxCount === 'number' && Number.isFinite(body.maxCount)) args.maxCount = body.maxCount
+          try {
+            const reply = await invokeHost('fs.pickFiles', args, { timeoutMs: USER_CHOICE_TIMEOUT_MS })
+            if (reply?.ok !== true) {
+              sendJson(res, 200, {
+                ok: false,
+                error: {
+                  code: 'import-failed',
+                  message: typeof reply?.hint === 'string' ? reply.hint : 'fs.pickFiles did not answer ok:true',
+                },
+              })
+              return
+            }
+            sendJson(res, 200, {
+              ok: true,
+              dir: typeof reply.dir === 'string' ? reply.dir : '',
+              cancelled: reply.cancelled === true,
+              files: Array.isArray(reply.files) ? reply.files : [],
+            })
+          } catch (error) {
+            sendJson(res, 200, {
+              ok: false,
+              error: {
+                code: 'import-failed',
+                message: error instanceof Error ? error.message : String(error),
+              },
+            })
+          }
+        },
+      }),
+    'workspace-picker: POST import',
   )
 }

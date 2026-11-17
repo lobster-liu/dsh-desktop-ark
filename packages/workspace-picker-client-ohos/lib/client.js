@@ -28,13 +28,17 @@ window.__ModuleLoader__.load({
       permissionTitle: '未获得该目录的访问权限',
       permissionBody: '点「请求权限」按系统提示授权；授权后点「刷新」即可浏览。',
       permissionDenied: '用户拒绝了授权。系统在「曾经拒绝/被撤销」后不再弹窗，可去系统设置里开启该权限再点「刷新」。',
-      permissionInvalid: '平台不受理本次授权请求（authResult=2，常见于手机形态或应用不在前台）。可点「刷新」重试，或改用系统文件选择器。',
+      permissionInvalid: '平台不受理本次授权请求（authResult=2）。手机形态下系统只向白名单应用开放「文档/下载」目录授权（系统日志 isSupportDirectoryPG=false），任何第三方应用都申请不到；请改用「从文件导入」，选中的文件会拷贝进沙箱工作区。',
       permissionUnknown: '平台没有给出授权结果（authResults 为空），且目录仍不可读——可能是刚才点了「不允许」，也可能是平台不受理该请求。可点「请求权限」重试；若反复无效，请到「设置 → 应用 → 权限」手动开启后点「刷新」。',
       permissionUnreadable: '平台报「已授权」，但目录实际仍不可读。可重启应用后再点「刷新」，或去系统设置里撤销后重新授权。',
       permissionUnavailable: '无法判定权限状态（宿主桥不可用）——请确认应用已正常启动后再试。',
       missingTitle: '此设备没有该目录',
       missingBody: '路径不存在（不是权限问题）。可点「刷新」重新检测，或用「沙箱」目录作为工作区。',
       failed: '打开失败',
+      importFiles: '从文件导入',
+      importHint: '用系统文件选择器把文件拷进「沙箱 / imports」，之后在这里选中沙箱作为工作区即可。',
+      importing: '等待选择…',
+      importCancelled: '已取消导入。',
     }
 
     const S = {
@@ -98,6 +102,7 @@ window.__ModuleLoader__.load({
       gateBody: { color: '#666', fontSize: 13, marginBottom: 16 },
       input: { padding: '7px 10px', borderRadius: 8, border: '1px solid #dcdcdc', minWidth: 180, font: 'inherit' },
       error: { color: '#b3261e', fontSize: 12, padding: '0 18px 8px' },
+      notice: { color: '#1f6f43', fontSize: 12, padding: '0 18px 8px' },
     }
 
     /**
@@ -146,6 +151,8 @@ window.__ModuleLoader__.load({
       const [listing, setListing] = React.useState(null)
       const [loading, setLoading] = React.useState(false)
       const [error, setError] = React.useState('')
+      const [notice, setNotice] = React.useState('')
+      const [importing, setImporting] = React.useState(false)
       const [gate, setGate] = React.useState(null)
       const [creating, setCreating] = React.useState(false)
       const [folderName, setFolderName] = React.useState('')
@@ -207,6 +214,7 @@ window.__ModuleLoader__.load({
         setCreating(false)
         setFolderName('')
         setError('')
+        setNotice('')
         const root = (await loadRoots()).find((candidate) => candidate.id === id)
         if (id === 'sandbox') {
           await loadListing(undefined)
@@ -269,6 +277,37 @@ window.__ModuleLoader__.load({
           if (mounted.current) setError(`${COPY.failed}: ${failure instanceof Error ? failure.message : String(failure)}`)
         } finally {
           if (mounted.current) setLoading(false)
+        }
+      }
+
+      /**
+       * 用系统文件选择器导入手上的文件：选中 → ArkTS 拷贝进沙箱 `<workspace>/imports`
+       * → 自动切到「沙箱」Tab 让用户看到导入结果。
+       */
+      const importFiles = async () => {
+        setImporting(true)
+        setError('')
+        setNotice('')
+        try {
+          const payload = await callRoute('/import', { maxCount: 20 }, 600_000)
+          if (!mounted.current) return
+          if (payload.ok !== true) {
+            setError(`${COPY.failed}: ${payload.error ? payload.error.message : 'unknown'}`)
+            return
+          }
+          if (payload.cancelled === true) {
+            setNotice(COPY.importCancelled)
+            return
+          }
+          const files = Array.isArray(payload.files) ? payload.files : []
+          setNotice(`已导入 ${files.length} 个文件到 沙箱/imports。`)
+          setTab('sandbox')
+          setGate(null)
+          await loadListing(undefined)
+        } catch (failure) {
+          if (mounted.current) setError(`${COPY.failed}: ${failure instanceof Error ? failure.message : String(failure)}`)
+        } finally {
+          if (mounted.current) setImporting(false)
         }
       }
 
@@ -339,6 +378,7 @@ window.__ModuleLoader__.load({
             ),
           ),
           error !== '' && h('div', { style: S.error }, error),
+          notice !== '' && h('div', { style: S.notice }, notice),
           h('div', { style: S.body },
             loading && h('div', { style: S.muted }, COPY.loading),
             // 目录不存在（设备没有用户主目录）：只给「刷新」，不给「请求权限」——授权解决不了。
@@ -359,6 +399,7 @@ window.__ModuleLoader__.load({
                 COPY.permissionBody,
                 gate.reason === 'denied' ? h('div', { style: { marginTop: 6 } }, COPY.permissionDenied) : null,
                 gate.reason === 'invalid' ? h('div', { style: { marginTop: 6 } }, COPY.permissionInvalid) : null,
+                gate.reason === 'invalid' ? h('div', { style: { marginTop: 6, color: '#666' } }, COPY.importHint) : null,
                 gate.reason === 'unknown' ? h('div', { style: { marginTop: 6 } }, COPY.permissionUnknown) : null,
                 gate.reason === 'granted-unreadable' ? h('div', { style: { marginTop: 6 } }, COPY.permissionUnreadable) : null,
                 gate.reason === 'unavailable' ? h('div', { style: { marginTop: 6 } }, COPY.permissionUnavailable) : null,
@@ -367,6 +408,9 @@ window.__ModuleLoader__.load({
               h('div', { style: { display: 'flex', gap: 8, justifyContent: 'center' } },
                 h('button', { type: 'button', style: S.btn(true), onClick: requestPermission }, COPY.requestPermission),
                 h('button', { type: 'button', style: S.btn(false), onClick: refresh }, COPY.refresh),
+                importing
+                  ? h('button', { type: 'button', style: S.btn(false), disabled: true }, COPY.importing)
+                  : h('button', { type: 'button', style: S.btn(false), onClick: importFiles }, COPY.importFiles),
               ),
             ),
             !loading && gate === null && listing !== null && (listing.entries ?? []).length === 0 &&

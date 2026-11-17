@@ -35,11 +35,24 @@ export const FACTS_PATH = '/_ohos/facts'
 /** Credential-shaped names that must never appear in the payload. */
 export const SENSITIVE_ENV_PATTERN = /TOKEN|KEY|SECRET|PASSWORD|AUTH|COOKIE|CREDENTIAL|SESSION/i
 
-/** Host capabilities that are implemented in this build (`HostCapabilities.ets:189-195`). */
-export const IMPLEMENTED_CAPABILITIES = Object.freeze(HOST_CAPABILITIES.slice(0, 6))
+/** Host capabilities that are really implemented in this build (`HostCapabilities.ets` install()). */
+const IMPLEMENTED_NAMES = Object.freeze([
+  'runtime.facts',
+  'log.hilog',
+  'perm.check',
+  'perm.request',
+  'perm.openAppInfo',
+  'shell.openExternal',
+  'image.normalize',
+  // 手机形态下「文档/下载」目录授权被平台白名单挡住，系统文件选择器是唯一可行入口
+  'fs.pickFiles',
+])
 
-/** Host capabilities registered as `not-implemented` placeholders. */
-export const PLACEHOLDER_CAPABILITIES = Object.freeze(HOST_CAPABILITIES.slice(6))
+/** Host capabilities that remain `not-implemented` placeholders. */
+const PLACEHOLDER_NAMES = Object.freeze(HOST_CAPABILITIES.filter((name) => !IMPLEMENTED_NAMES.includes(name)))
+
+export const IMPLEMENTED_CAPABILITIES = IMPLEMENTED_NAMES
+export const PLACEHOLDER_CAPABILITIES = PLACEHOLDER_NAMES
 
 function messageOf(error) {
   return error instanceof Error ? error.message : String(error)

@@ -89,9 +89,11 @@ await test('metadata: plugin name, inject, path, capability split', () => {
   assert.equal(facts.name, 'facts-ohos')
   assert.deepEqual(facts.inject, ['webServer', 'connection'])
   assert.equal(facts.FACTS_PATH, '/_ohos/facts')
-  assert.equal(facts.IMPLEMENTED_CAPABILITIES.length, 6)
-  assert.equal(facts.PLACEHOLDER_CAPABILITIES.length, 8)
-  assert.ok(facts.PLACEHOLDER_CAPABILITIES.includes('image.normalize'))
+  assert.equal(facts.IMPLEMENTED_CAPABILITIES.length, 8)
+  assert.equal(facts.PLACEHOLDER_CAPABILITIES.length, 6)
+  assert.ok(facts.IMPLEMENTED_CAPABILITIES.includes('image.normalize'))
+  assert.ok(facts.IMPLEMENTED_CAPABILITIES.includes('fs.pickFiles'))
+  assert.ok(facts.PLACEHOLDER_CAPABILITIES.includes('fs.pickFolder'))
 })
 
 await test('dshOhosEnv: only DSH_OHOS_* names, sensitive names redacted (value never read)', () => {
@@ -201,7 +203,9 @@ await test('apply(): GET returns the JSON snapshot with no token value', () => {
     route.handler(makeRequest({ method: 'GET' }), response)
     assert.equal(response.statusCode, 200)
     const payload = JSON.parse(response.body)
-    assert.equal(payload.capabilities.hostBridge.placeholders.length, 8)
+    assert.equal(payload.capabilities.hostBridge.placeholders.length, 6)
+    assert.ok(payload.capabilities.hostBridge.implemented.includes('fs.pickFiles'))
+    assert.ok(payload.capabilities.hostBridge.placeholders.includes('fs.pickFolder'))
     assert.ok(payload.redactedEnv.includes('DSH_OHOS_TOKEN'))
     assert.equal(response.body.includes('endpoint-secret'), false)
   } finally {

@@ -18,6 +18,8 @@ export const state = {
   requestVoid: false,
   /** true = perm.request 返回空 authResults（平台根本没应答） */
   emptyResults: false,
+  /** fs.pickFiles 的应答；null = 未登记（模拟宿主没实现该能力） */
+  pickFiles: null,
 }
 
 /**
@@ -40,6 +42,7 @@ export async function invoke(name, args) {
     if (state.requestVoid === true) return { ok: true, authResults: [2] }
     return { ok: true, authResults: [state.grantRequest === true ? 0 : -1] }
   }
+  if (name === 'fs.pickFiles') return state.pickFiles ?? { ok: false, error: 'unregistered' }
   return { ok: false, error: 'unregistered' }
 }
 

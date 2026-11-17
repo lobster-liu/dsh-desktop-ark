@@ -384,6 +384,52 @@ Abort、FormData、惰性 getter 封印、`fetch` 可用），耗时 ≈195 ms�
 
 ---
 
+## 7. 手机形态：目录权限被平台白名单拦死，改走「从文件导入」（2026-11-17，Pura X Max / API 26）
+
+2in1 上 §5 的结论（点「允许」即授予、`grantStatus=0`/`grantFlag=2`）**在手机形态不成立**。同一份
+`requestPermissions` 声明，在 phone 上点「请求权限」直接被平台终止，`authResult=2`：
+
+```
+[SPC][PermissionDialog][Ability]: caller permision: ["ohos.permission.READ_WRITE_DOCUMENTS_DIRECTORY"].
+[SPC][DEFAULT][SystemParameterEnhanceHelper]: getDirectoryPGConfigValue configValue: 3
+[SPC][DEFAULT][DirectoryPermissionConfigUtils]: getSupportDirectoryPGApps res:[…com.edrawsoft.edrawmax.pc / cn.wps.office.hap / com.foxit.foxitpdfeditor / com.processon…]
+[SPC][PermissionDialog][BasePermissionStrategy]: isSupportDirectoryPG cost: 14, isSupport:false
+E [SPC][PermissionDialog][Model]: ohos.permission.READ_WRITE_DOCUMENTS_DIRECTORY not support.
+W [SPC][PermissionDialog][Model]: terminate session with result, resultCode: 0, reqPerms: […], result: [2].
+```
+
+即「文档 / 下载」两项目录权限在手机上是**按 `appIdentifier`/bundleName 白名单发放**（私有配置
+`configValue: 3`，名单里是 WPS / Foxit / ProcessOn 这类已上架应用），旁加载的第三方包永远进不去白名单
+——`authResult=2` 是终局，重试、重启、重新安装都不会变。权限定义本身没问题
+（`permission_definitions.json`：`grantMode: user_grant`、`availableLevel: normal`、`since: 11`、
+`provisionEnable: true`），`bm dump` 也显示两项已声明（状态 `-1`）。
+
+**为什么不能退而求其次「选文件夹」**：SDK `@ohos.file.picker.d.ts` 里 `DocumentSelectMode.FOLDER`
+标注 `Only 2-in-1 devices are supported`（`@syscap ...FolderSelection`），手机没有目录选择；
+`@ohos.fileshare.persistPermission` 需要 `ohos.permission.FILE_ACCESS_PERSIST`，同样要授权面。
+
+**兜底形态：系统文件选择器（单次文件授权）+ 拷进沙箱**。手机上唯一可行的「把本地文件交给 DSH」的路径：
+
+- 宿主能力 `fs.pickFiles`（`entry/src/main/ets/host/HostCapabilities.ets`）：`picker.DocumentViewPicker`
+  `selectMode = FILE`、`maxSelectNumber = min(maxCount, 50)`；返回的每个 uri 用
+  `fileIo.openSync(uri, READ_ONLY)` + `copyFileSync` 落进 `<沙箱>/imports`，重名自动加 `-1/-2`
+  不覆盖；用户取消（`13900020` / `13900042`）返回 `cancelled: true` 而不是报错。
+- 路由 `POST /_ohos/picker/import`（`packages/workspace-picker-ohos/lib/routes.js`），
+  以 `USER_CHOICE_TIMEOUT_MS` 等用户选完。
+- 客户端：工作区选择器「文档 / 下载」标签页的授权门里多一个「从文件导入」按钮
+  （`packages/workspace-picker-client-ohos/lib/client.js`），导入完成后自动跳到「沙箱」标签并提示
+  「已导入 N 个文件到 沙箱/imports。」。
+
+**实测（2026-11-17，HOP-AL10 / Pura X Max / API 26 / phone）**：点「从文件导入」→ 系统文件选择器
+弹出（带「安全访问文件：应用仅可访问您选定的文件」提示、`已选 0/20`）→ 选中 `9 - Hangul-E-book.pdf`
+（2.94 MB）→ 确认后沙箱 `files/workspace/imports/9 - Hangul-E-book.pdf` 落盘 **2939616 字节**，
+页面提示「已导入 1 个文件到 沙箱/imports。」，选择器以「沙箱」目录打开工作区，对话正常。
+
+> 结论：手机形态下不要再去申请 `READ_WRITE_DOCUMENTS_DIRECTORY` / `READ_WRITE_DOWNLOAD_DIRECTORY`
+> （申请只会得到一次 `authResult=2` 的失败弹窗），把「从文件导入」当作手机上的标准入口。
+
+---
+
 ## 迁移说明（2026-10-22）：ohos-node-bridge → ohpm 中心仓包
 
 > 正文引用的 `ohos-node-bridge` 探针记录与「委托 `tools/provision.mjs` 投放」口径为当时同级 submodule 的历史做法。2026-10-22 起该库已发布为中心仓双包 `@fellow99/node-bridge@0.1.0` + `@fellow99/node-runtime@24.2.0`，运行时经 `ohpm install` 随包分发，本地投放脚本已删除；探针/权限结论本身不受分发方式影响。现行事实源见 `specs/TECH.md` §3 与 `specs/SPECS_CHECKLIST.md`（2026-10-22 闭合块）。
