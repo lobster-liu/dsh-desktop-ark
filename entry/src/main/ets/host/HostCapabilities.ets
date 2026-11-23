@@ -109,6 +109,8 @@ interface RecordArgs {
   minVoicedMs?: number;
   /** 人声判定阈值（RMS，0-32767）；不给就按本底噪声自适应。 */
   threshold?: number;
+  /** 蓝牙优先时，蓝牙麦多少毫秒内没听到人声就回落手机麦（默认 2500ms）。 */
+  probeMs?: number;
 }
 
 /** 一次录音的停止原因：说完自动停 / 到了时长上限 / 字节上限。 */
@@ -118,6 +120,11 @@ interface CaptureOptions {
   silenceMs: number;
   minVoicedMs: number;
   threshold: number;
+  /**
+   * 蓝牙优先用：这么多毫秒内一句话都没听到就收尾（stopReason = silent-probe），
+   * 调用方随即改用手机麦重录同一段，避免把开头几个字丢在静音的蓝牙通路上。
+   */
+  probeMs?: number;
 }
 
 /** `speech.record` 结果：PCM 文件落在应用沙箱里。 */
@@ -282,12 +289,14 @@ export class HostCapabilities {
   private static readonly SPEECH_CHUNK_PACE_MS: number = 20;
 
   /**
-   * 蓝牙麦探测缓存。
+   * 蓝牙优先的重试闸门与上次可用的设备。
    *
-   * 系统会把所有配对过的 SCO 设备都列出来，逐个试 1.2 秒；真机上这几台全静音（系统不给
-   * 第三方 App 耳机麦），于是每轮白等 3.6 秒。全静音后 10 分钟内直接走手机麦。
+   * 策略：每轮先让蓝牙麦说话（probeMs 内听到人声就一直用它，开头几个字也不丢）；
+   * 听不到就当场切手机麦重录同一段，并且 5 分钟内不再浪费这 2.5 秒。
    */
-  private static btSilentUntil: number = 0;
+  private static btRetryAt: number = 0;
+  /** 上次听到人声的蓝牙设备 id；-1 表示还没有。 */
+  private static btCandidateId: number = -1;
 
   private static delay(ms: number): Promise<void> {
     return new Promise<void>((resolve: () => void) => {
@@ -605,36 +614,55 @@ export class HostCapabilities {
       }
       const phones: audio.AudioDeviceDescriptor[] = HostCapabilities.pickDevices(candidates, false);
       const bluetooths: audio.AudioDeviceDescriptor[] = HostCapabilities.pickDevices(candidates, true);
-      // 系统会把「已配对过的所有 SCO 设备」都列出来（真机一次列出 3 个：眼镜、耳机、车机），
-      // 默认路由经常落到不存在的那个上 → 录到静音。所以逐个短探 1.2s，谁有声音就用谁。
-      let bluetooth: audio.AudioDeviceDescriptor | null = null;
-      if (bluetooths.length > 0 && Date.now() >= HostCapabilities.btSilentUntil) {
+      const phone: audio.AudioDeviceDescriptor | null = phones.length > 0 ? phones[0] : null;
+      // 蓝牙优先：系统会把「配对过的所有 SCO 设备」都列出来（真机一次 3 个：眼镜、耳机、车机），
+      // 默认路由常落到不存在的那个。所以优先上次听到过人声的 id，没有就用第一个；
+      // probeMs 内一句话都没听到就当作这条路走不通，立刻切手机麦重录同一段 —— 开头几个字
+      // 不会丢在静音的蓝牙通路上。
+      let triedBluetooth: boolean = false;
+      let btStats: CaptureStats | null = null;
+      if (bluetooths.length > 0 && Date.now() >= HostCapabilities.btRetryAt) {
+        triedBluetooth = true;
+        let pick: audio.AudioDeviceDescriptor = bluetooths[0];
         for (let i = 0; i < bluetooths.length; i++) {
-          const stats: CaptureStats = await HostCapabilities.captureToFile(context, path, 1200, bluetooths[i],
-            audio.SourceType.SOURCE_TYPE_VOICE_COMMUNICATION);
-          HostCapabilities.appLog(context,
-            `speech.record 蓝牙探测 id=${bluetooths[i].id} peak=${stats.peak}`);
-          if (stats.peak >= 300) {
-            bluetooth = bluetooths[i];
+          if (bluetooths[i].id === HostCapabilities.btCandidateId) {
+            pick = bluetooths[i];
             break;
           }
         }
-        if (bluetooth === null) {
-          HostCapabilities.btSilentUntil = Date.now() + 600000;
-          HostCapabilities.appLog(context, 'speech.record 蓝牙麦全部静音（系统不给第三方 App 耳机麦），10 分钟内直接用手机麦');
+        const probeOptions: CaptureOptions = {
+          autoStop: true,
+          maxMs: maxMs,
+          silenceMs: options.silenceMs,
+          minVoicedMs: 200,
+          threshold: 0,
+          probeMs: Math.min(Math.max(parsed.probeMs ?? 2500, 800), 6000)
+        };
+        const attempt: CaptureStats = await HostCapabilities.captureSpeech(context, path, probeOptions, pick,
+          audio.SourceType.SOURCE_TYPE_VOICE_COMMUNICATION);
+        HostCapabilities.appLog(context,
+          `speech.record 蓝牙优先 id=${pick.id} peak=${attempt.peak} voiced=${attempt.voicedMs}ms reason=${attempt.stopReason}`);
+        if (attempt.stopReason !== 'silent-probe' && attempt.voicedMs > 0) {
+          btStats = attempt;
+          HostCapabilities.btCandidateId = pick.id;
+          HostCapabilities.btRetryAt = 0;
+        } else {
+          // 走不通：记下来，5 分钟内不再白等这 2.5 秒。
+          HostCapabilities.btCandidateId = -1;
+          HostCapabilities.btRetryAt = Date.now() + 300000;
+          HostCapabilities.appLog(context, 'speech.record 蓝牙麦 2.5 秒内没人声，当场回落手机麦（5 分钟后再试）');
         }
       }
       let stats: CaptureStats;
       let input: string;
-      if (bluetooth !== null) {
-        stats = await HostCapabilities.captureSpeech(context, path, options, bluetooth,
-          audio.SourceType.SOURCE_TYPE_VOICE_COMMUNICATION);
+      if (btStats !== null) {
+        stats = btStats;
         input = 'bluetooth';
       } else {
-        // 蓝牙都没声音就用手机麦；用「语音识别」采集源，系统会做降噪/AGC，识别更稳。
-        stats = await HostCapabilities.captureSpeech(context, path, options,
-          phones.length > 0 ? phones[0] : null, audio.SourceType.SOURCE_TYPE_VOICE_RECOGNITION);
-        input = 'phone';
+        // 手机麦：用「语音识别」采集源，系统会做降噪/AGC，识别更稳。
+        stats = await HostCapabilities.captureSpeech(context, path, options, phone,
+          audio.SourceType.SOURCE_TYPE_VOICE_RECOGNITION);
+        input = triedBluetooth ? 'phone-fallback' : 'phone';
       }
       const result: RecordResult = {
         ok: stats.bytes > 0,
@@ -835,6 +863,11 @@ export class HostCapabilities {
           }
           if (voicedMs >= options.minVoicedMs && silenceRunMs >= options.silenceMs) {
             stopReason = 'silence';
+            done = true;
+          } else if (options.probeMs !== undefined && options.probeMs > 0 && voicedMs === 0
+            && totalMs >= options.probeMs) {
+            // 蓝牙优先：这段通路上一直没人声，交给调用方换设备重录。
+            stopReason = 'silent-probe';
             done = true;
           } else if (voicedMs === 0 && silenceRunMs >= 2500) {
             // 一句话都没说：别硬等满 30 秒。
