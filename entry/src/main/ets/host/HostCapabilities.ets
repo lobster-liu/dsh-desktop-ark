@@ -287,6 +287,33 @@ export class HostCapabilities {
    */
   private static readonly SPEECH_CHUNK_BYTES: number = 640;
   private static readonly SPEECH_CHUNK_PACE_MS: number = 20;
+  /**
+   * 单个识别会话喂给引擎的音频长度。
+   *
+   * 离线引擎一次只认得好几秒（真机实测：12.9 秒整段喂进一个会话，只回「状况。」三个字，
+   * 而同一段音频云端 ASR 能听出整句）；把长录音切成几秒一段、每段单独开会话再拼文本，
+   * 比让引擎硬扛整段稳。切分点的音素损失远小于整段崩掉。
+   */
+  /** 切段时优先落在停顿上：至少喂满 2 秒才开始找停顿，最多 6 秒硬切。 */
+  private static readonly SPEECH_SEGMENT_MIN_BYTES: number = 16000 * 2 * 2;
+  private static readonly SPEECH_SEGMENT_MAX_BYTES: number = 16000 * 2 * 6;
+  /** 判定为「停顿」的块均方根（int16 采样，安静时通常 < 300）。 */
+  private static readonly SPEECH_PAUSE_RMS: number = 400;
+
+  /** 一块 PCM16 的均方根：用来找句间停顿，把识别会话切在没人说话的地方。 */
+  private static chunkRms(bytes: Uint8Array): number {
+    const view: DataView = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const samples: number = Math.floor(bytes.byteLength / 2);
+    let sum: number = 0;
+    for (let i = 0; i < samples; i++) {
+      const value: number = view.getInt16(i * 2, true);
+      sum += value * value;
+    }
+    if (samples === 0) {
+      return 0;
+    }
+    return Math.sqrt(sum / samples);
+  }
 
   /**
    * 蓝牙优先的重试闸门与上次可用的设备。
@@ -615,14 +642,15 @@ export class HostCapabilities {
       const phones: audio.AudioDeviceDescriptor[] = HostCapabilities.pickDevices(candidates, false);
       const bluetooths: audio.AudioDeviceDescriptor[] = HostCapabilities.pickDevices(candidates, true);
       const phone: audio.AudioDeviceDescriptor | null = phones.length > 0 ? phones[0] : null;
-      // 蓝牙优先：系统会把「配对过的所有 SCO 设备」都列出来（真机一次 3 个：眼镜、耳机、车机），
-      // 默认路由常落到不存在的那个。所以优先上次听到过人声的 id，没有就用第一个；
-      // probeMs 内一句话都没听到就当作这条路走不通，立刻切手机麦重录同一段 —— 开头几个字
-      // 不会丢在静音的蓝牙通路上。
-      let triedBluetooth: boolean = false;
-      let btStats: CaptureStats | null = null;
-      if (bluetooths.length > 0 && Date.now() >= HostCapabilities.btRetryAt) {
-        triedBluetooth = true;
+      // 手机麦立刻开录，不做任何前置探测。
+      // 真机实测：蓝牙 SCO 通路上拿不到音频（探测峰值个位数），而先把 2.5 秒花在它上面，
+      // 用户开口的头几个字就整段丢了（用户反馈「识别前边的拾音会缺失好几秒」）。
+      // 所以顺序反过来：先录手机麦；只有「手机麦一个音节都没听到」时才回头试蓝牙（罕见路径）。
+      let stats: CaptureStats = await HostCapabilities.captureSpeech(context, path, options, phone,
+        audio.SourceType.SOURCE_TYPE_VOICE_RECOGNITION);
+      let input: string = 'phone';
+      if (stats.voicedMs === 0 && bluetooths.length > 0 && Date.now() >= HostCapabilities.btRetryAt) {
+        HostCapabilities.appLog(context, 'speech.record 手机麦没听到人声，回头再试蓝牙麦');
         let pick: audio.AudioDeviceDescriptor = bluetooths[0];
         for (let i = 0; i < bluetooths.length; i++) {
           if (bluetooths[i].id === HostCapabilities.btCandidateId) {
@@ -630,39 +658,29 @@ export class HostCapabilities {
             break;
           }
         }
-        const probeOptions: CaptureOptions = {
+        const retryMaxMs: number = Math.min(maxMs, 8000);
+        const retryOptions: CaptureOptions = {
           autoStop: true,
-          maxMs: maxMs,
+          maxMs: retryMaxMs,
           silenceMs: options.silenceMs,
           minVoicedMs: 200,
-          threshold: 0,
-          probeMs: Math.min(Math.max(parsed.probeMs ?? 2500, 800), 6000)
+          threshold: 0
         };
-        const attempt: CaptureStats = await HostCapabilities.captureSpeech(context, path, probeOptions, pick,
+        const attempt: CaptureStats = await HostCapabilities.captureSpeech(context, path, retryOptions, pick,
           audio.SourceType.SOURCE_TYPE_VOICE_COMMUNICATION);
         HostCapabilities.appLog(context,
-          `speech.record 蓝牙优先 id=${pick.id} peak=${attempt.peak} voiced=${attempt.voicedMs}ms reason=${attempt.stopReason}`);
-        if (attempt.stopReason !== 'silent-probe' && attempt.voicedMs > 0) {
-          btStats = attempt;
+          `speech.record 蓝牙重试 id=${pick.id} peak=${attempt.peak} voiced=${attempt.voicedMs}ms reason=${attempt.stopReason}`);
+        if (attempt.voicedMs > 0) {
+          stats = attempt;
+          input = 'bluetooth';
           HostCapabilities.btCandidateId = pick.id;
           HostCapabilities.btRetryAt = 0;
         } else {
-          // 走不通：记下来，5 分钟内不再白等这 2.5 秒。
+          // 走不通：5 分钟内不再为了它多花时间。
           HostCapabilities.btCandidateId = -1;
           HostCapabilities.btRetryAt = Date.now() + 300000;
-          HostCapabilities.appLog(context, 'speech.record 蓝牙麦 2.5 秒内没人声，当场回落手机麦（5 分钟后再试）');
+          input = 'phone';
         }
-      }
-      let stats: CaptureStats;
-      let input: string;
-      if (btStats !== null) {
-        stats = btStats;
-        input = 'bluetooth';
-      } else {
-        // 手机麦：用「语音识别」采集源，系统会做降噪/AGC，识别更稳。
-        stats = await HostCapabilities.captureSpeech(context, path, options, phone,
-          audio.SourceType.SOURCE_TYPE_VOICE_RECOGNITION);
-        input = triedBluetooth ? 'phone-fallback' : 'phone';
       }
       const result: RecordResult = {
         ok: stats.bytes > 0,
@@ -1236,6 +1254,15 @@ export class HostCapabilities {
           if (written) {
             sent += room;
             bytesThisSession += room;
+          }
+          if (bytesThisSession >= HostCapabilities.SPEECH_SEGMENT_MIN_BYTES &&
+            HostCapabilities.chunkRms(chunk) < HostCapabilities.SPEECH_PAUSE_RMS) {
+            // 落在句间停顿上换会话：硬切会把词切成两半（实测「状况」被切成「不。况。」）。
+            break;
+          }
+          if (bytesThisSession >= HostCapabilities.SPEECH_SEGMENT_MAX_BYTES) {
+            // 一直没停顿就按 6 秒硬切：喂得太长引擎会整段崩（12.9 秒只回「状况。」）。
+            break;
           }
           await HostCapabilities.delay(paceMs);
           if (resolved) {

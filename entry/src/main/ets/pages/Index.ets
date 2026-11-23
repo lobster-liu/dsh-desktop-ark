@@ -5,6 +5,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import BuildProfile from 'BuildProfile';
 import { Constants } from '../common/Constants';
 import { DshRuntime, LaunchPhase, LaunchSnapshot } from '../app/DshRuntime';
+import { Probe } from '../app/Probe';
 import { HostCapabilities } from '../host/HostCapabilities';
 /** 页面里读回来的会话状态（buildReadScript 的返回结构）。*/
 interface PageReplyState {
@@ -42,6 +43,9 @@ struct Index {
   private attached: boolean = false;
   private historyCleared: boolean = false;
   private pendingUrl: string = '';
+  // 页面加载尝试次数：加载失败会带着这个计数重试（最多 10 次），用于扛住
+  // 「Host 刚 ready、监听还没接上连接」的窗口期。
+  private loadAttempts: number = 0;
 
   @State phase: string = LaunchPhase.IDLE;
   @State statusText: string = '正在启动…';
@@ -54,6 +58,9 @@ struct Index {
   @State callStatus: string = '点「说话」，说完自动发送';
   @State callTranscript: string = '';
   @State callReply: string = '';
+  // 每轮通话一个序号：点「挂断」就自增，让还在等待中的旧轮次在下一个 await 之后自行退出。
+  // 用户要求「挂断要随时能按，不用等朗读念完」，所以按钮不再按状态禁用，靠这个序号收尾。
+  private callTurnId: number = 0;
 
   aboutToAppear(): void {
     // 调试通道：debug 构建开。ArkWeb 远程调试（CDP），release 关闭。
@@ -65,6 +72,15 @@ struct Index {
       }
     }
     const context: common.UIAbilityContext = getContext(this) as common.UIAbilityContext;
+    // ArkWeb 会把 127.0.0.1 上的 Cookie 一路攒下来；积累过多后请求头超过 Node 的 16KB 上限，
+    // 本地服务直接回 431，页面就停在 arkweb-error 白屏（2026-11-23 真机复现，重启也不恢复）。
+    // 本地 DSH 的登录凭据在 URL token 与会话存储里，Cookie 用不上，启动时清一次。
+    try {
+      webview.WebCookieManager.clearAllCookiesSync();
+    } catch (error) {
+      hilog.warn(Constants.HILOG_DOMAIN, Constants.HILOG_TAG, 'clearAllCookies 失败：%{public}s',
+        error instanceof Error ? error.message : String(error));
+    }
     this.runtime.launch(context, (snapshot: LaunchSnapshot): void => {
       this.phase = snapshot.phase;
       this.statusText = snapshot.message;
@@ -83,13 +99,28 @@ struct Index {
     if (!this.attached || this.pendingUrl === '') {
       return;
     }
-    try {
-      this.controller.loadUrl(this.pendingUrl);
-    } catch (error) {
-      const message: string = error instanceof Error ? error.message : String(error);
-      this.detail = `loadUrl 失败：${message}`;
-      this.showOverlay = true;
-    }
+    const url: string = this.pendingUrl;
+    this.loadAttempts++;
+    const attempt: number = this.loadAttempts;
+    // 加载前先探活：Host 刚写 ready.json 时监听可能还没开始接受连接，这时直接 loadUrl
+    // 会落到 ArkWeb 的 arkweb-error 错误页（整页白屏，而且不会自己恢复——真机上出现过）。
+    // 等它真能连上（HEAD 通）再加载，最多等 2 秒。
+    Probe.waitFor(url, 8, 250).then((alive: boolean): void => {
+      if (attempt !== this.loadAttempts) {
+        // 期间又发起了新的加载，交给最新那一次。
+        return;
+      }
+      if (!alive) {
+        console.warn(`[DSH_DESKTOP_ARK] 探活未通过，仍然尝试加载：${url}`);
+      }
+      try {
+        this.controller.loadUrl(url);
+      } catch (error) {
+        const message: string = error instanceof Error ? error.message : String(error);
+        this.detail = `loadUrl 失败：${message}`;
+        this.showOverlay = true;
+      }
+    });
   }
 
   private openExternal(url: string): void {
@@ -229,7 +260,30 @@ struct Index {
       if (!row) { return 'no-session'; }
       const inner = row.querySelector('[role="button"]') || row;
       inner.click();
+      // 点会话行会让 composer 拿到焦点，把软键盘顶出来：语音通话用不到键盘，
+      // 而且键盘弹起会盖住面板。点完立刻把焦点还回去（真机反馈「第一次点说话总弹键盘」）。
+      try {
+        const active = document.activeElement;
+        if (active && typeof active.blur === 'function') { active.blur(); }
+        if (document.body && typeof document.body.focus === 'function') { document.body.focus(); }
+        if (window.getSelection) { window.getSelection().removeAllRanges(); }
+      } catch (error) { /* 忽略：焦点操作失败不影响通话 */ }
       return 'clicked';
+    })()`;
+  }
+
+  /** 把页面里的焦点收掉，避免软键盘被顶出来（语音通话全程不需要键盘）。*/
+  private buildBlurScript(): string {
+    return `(() => {
+      try {
+        const active = document.activeElement;
+        if (active && typeof active.blur === 'function') { active.blur(); }
+        if (document.body && typeof document.body.focus === 'function') { document.body.focus(); }
+        if (window.getSelection) { window.getSelection().removeAllRanges(); }
+        return 'blurred';
+      } catch (error) {
+        return 'blur-failed';
+      }
     })()`;
   }
 
@@ -370,55 +424,71 @@ struct Index {
    * 一轮半双工通话：录。。识别 。注入并发。。等回。。朗读。
    * 任一步失败就停在 `error` 状态并把原因显示在面板上。
    */
+  /** 这一轮是否还该继续（用户点过「挂断」就为 false）。*/
+  private liveTurn(turnId: number): boolean {
+    return turnId === this.callTurnId;
+  }
+
   private async runCallTurn(): Promise<void> {
-    if (this.callState !== 'idle' && this.callState !== 'error') {
+    // 朗读中也允许直接再说话：相当于「打断它、接着说」（用户要求「不要等念完才能继续」）。
+    if (this.callState !== 'idle' && this.callState !== 'error' && this.callState !== 'speaking') {
       return;
     }
+    const turnId: number = ++this.callTurnId;
     const context: common.UIAbilityContext = this.getUIContext().getHostContext() as common.UIAbilityContext;
     // 先掐掉上一轮还在念的回复：否则麦克风会把喇叭里的声音录进去，音频焦点也会打架。
     await HostCapabilities.stopSpeakForCall(context);
-    // 首页没有会话视图时，自动打开最近的会话：让用户「先去点会话、再回来点说话」太别扭（真机踩过）。
-    this.callState = 'listening';
-    this.callStatus = '正在准备会话…';
-    let sessionReady: boolean = false;
-    try {
-      const probe: string = await this.evalInPage(this.buildReadScript());
-      const probeState: string = (JSON.parse(probe) as PageReplyState).state ?? '';
-      sessionReady = probeState !== 'no-column';
-      if (!sessionReady) {
-        this.callStatus = '正在打开最近的会话…';
-        const opened: string = await this.evalInPage(this.buildOpenSessionRowScript());
-        if (opened !== 'clicked') {
-          this.callState = 'error';
-          this.callStatus = opened === 'no-row'
-            ? '没有可用的会话：先在 DSH 里发过一条消息'
-            : `打开会话失败：${opened}`;
-          return;
-        }
-        for (let i = 0; i < 24; i++) {
-          await this.sleep(250);
-          const again: string = await this.evalInPage(this.buildReadScript());
-          const nextState: string = (JSON.parse(again) as PageReplyState).state ?? '';
-          if (nextState !== 'no-column') {
-            sessionReady = true;
-            break;
-          }
-        }
-      }
-    } catch (error) {
-      sessionReady = false;
-    }
-    if (!sessionReady) {
-      this.callState = 'error';
-      this.callStatus = '没能打开会话：先在 DSH 里手动点开一个会话，再点「说话」';
+    if (!this.liveTurn(turnId)) {
       return;
     }
     this.callTranscript = '';
     this.callReply = '';
     this.callState = 'listening';
     this.callStatus = '正在听你说…（说完停 1 秒就自动结束，最长 30 秒）';
-    // 「说多久录多久」：30 秒只是安全上限，实际按静音检测收尾（用户反馈固定 6 秒会截断）。
-    const recorded = await HostCapabilities.recordForCall(context, 30000);
+    // 先开录、再准备会话：会话探测/打开可能要几百毫秒到几秒，放在录音之前会把用户开口的
+    // 头几个字整段丢掉（真机反馈「识别前边的拾音会缺失好几秒」）。录音在宿主侧跑，页面这边
+    // 同时去开会话，两边并行。
+    const recording = HostCapabilities.recordForCall(context, 30000);
+    // 首页没有会话视图时，自动打开最近的会话：让用户「先去点会话、再回来点说话」太别扭（真机踩过）。
+    let sessionReady: boolean = false;
+    try {
+      const probe: string = await this.evalInPage(this.buildReadScript());
+      const probeState: string = (JSON.parse(probe) as PageReplyState).state ?? '';
+      sessionReady = probeState !== 'no-column';
+      if (!sessionReady) {
+        const opened: string = await this.evalInPage(this.buildOpenSessionRowScript());
+        if (opened === 'clicked') {
+          for (let i = 0; i < 24; i++) {
+            await this.sleep(250);
+            const again: string = await this.evalInPage(this.buildReadScript());
+            const nextState: string = (JSON.parse(again) as PageReplyState).state ?? '';
+            if (nextState !== 'no-column') {
+              sessionReady = true;
+              break;
+            }
+          }
+        } else {
+          sessionReady = false;
+        }
+      }
+    } catch (error) {
+      sessionReady = false;
+    }
+    // 会话视图刚渲染完时 composer 可能又被自动聚焦（软键盘弹起来盖住面板），再收一次焦点。
+    try {
+      await this.evalInPage(this.buildBlurScript());
+    } catch (error) {
+      // 收不掉也不影响通话。
+    }
+    const recorded = await recording;
+    if (!this.liveTurn(turnId)) {
+      return;
+    }
+    if (!sessionReady) {
+      this.callState = 'error';
+      this.callStatus = '没能打开会话：先在 DSH 里手动点开一个会话，再点「说话」';
+      return;
+    }
     if (!recorded.ok || recorded.path === undefined) {
       this.callState = 'error';
       this.callStatus = `录音失败：${recorded.error ?? '没有拿到音频'}`;
@@ -463,6 +533,9 @@ struct Index {
     this.callTranscript = text;
     this.callState = 'sending';
     this.callStatus = `正在发送给 DSH…（识别：${engineNote}）`;
+    if (!this.liveTurn(turnId)) {
+      return;
+    }
     // 发之前记下页面上已有的最后一条回复与条目数，作为「本轮答复是否到了」的基线。
     let baseline: string = '';
     let baselineItems: number = 0;
@@ -490,6 +563,9 @@ struct Index {
     this.callState = 'waiting';
     this.callStatus = '等待 DSH 回复…';
     const reply: string = await this.waitForReply(120000, baseline, baselineItems);
+    if (!this.liveTurn(turnId)) {
+      return;
+    }
     if (reply === '') {
       this.callState = 'error';
       this.callStatus = '没有等到回复（可到会话页查看）';
@@ -503,6 +579,9 @@ struct Index {
     // 所以按字数估算的时长把「朗读中」保持住，别让用户以为读完了去点「说话」把它掐断。
     const waitMs: number = spoken.estimateMs !== undefined ? spoken.estimateMs : 3000;
     await this.sleep(waitMs);
+    if (!this.liveTurn(turnId)) {
+      return;
+    }
     this.callState = 'idle';
     this.callStatus = '说完了，点「说话」继续';
   }
@@ -572,6 +651,20 @@ struct Index {
           const info: string = event.error.getErrorInfo();
           if (!event.request.isMainFrame()) {
             console.warn(`[DSH_DESKTOP_ARK] 子资源加载失败（不影响页面）：${info} ${url}`);
+            return;
+          }
+          // 主文档加载失败：多半是 Host 端口刚换/监听刚起来，或 Cookie 攒多了让服务端回 431。
+          // 重试前顺手清一次 Cookie（本地服务用不到 Cookie），比直接白屏好。
+          if (this.loadAttempts < 10) {
+            this.detail = `页面加载失败：${info}（重试中 ${this.loadAttempts}/10）`;
+            try {
+              webview.WebCookieManager.clearAllCookiesSync();
+            } catch (error) {
+              // 清不掉也照样重试。
+            }
+            setTimeout((): void => {
+              this.loadPending();
+            }, 400);
             return;
           }
           this.detail = `页面加载失败：${info}`;
@@ -716,27 +809,45 @@ struct Index {
               .backgroundColor('#F5F5F5')
             }
 
-            Row({ space: 12 }) {
-              Button(this.callState === 'listening' ? '录音中…' : '说话')
-                .width(150)
+            Row({ space: 10 }) {
+              Button(this.callState === 'listening' ? '录音中…'
+                : this.callState === 'speaking' ? '打断并说话' : '说话')
+                .layoutWeight(1)
                 .height(52)
                 .backgroundColor('#0F766E')
                 .fontColor('#FFFFFF')
-                .enabled(this.callState === 'idle' || this.callState === 'error')
+                .enabled(this.callState === 'idle' || this.callState === 'error' || this.callState === 'speaking')
                 .onClick((): void => {
                   this.runCallTurn();
                 })
+              if (this.callState === 'speaking') {
+                Button('停止朗读')
+                  .layoutWeight(1)
+                  .height(52)
+                  .backgroundColor('#F59E0B')
+                  .fontColor('#FFFFFF')
+                  .onClick((): void => {
+                    // 只掐掉朗读、不挂断：用户想接着说，不该把整通通话退出。
+                    this.callTurnId++;
+                    const context: common.UIAbilityContext =
+                      this.getUIContext().getHostContext() as common.UIAbilityContext;
+                    HostCapabilities.stopSpeakForCall(context);
+                    this.callState = 'idle';
+                    this.callStatus = '已停止朗读，点「说话」接着说';
+                  })
+              }
               Button('挂断')
-                .width(110)
+                .layoutWeight(1)
                 .height(52)
-                .backgroundColor('#E5E7EB')
-                .fontColor('#111827')
-                .enabled(this.callState !== 'listening' && this.callState !== 'speaking')
+                .backgroundColor('#DC2626')
+                .fontColor('#FFFFFF')
                 .onClick((): void => {
+                  // 任何时候都能挂断（用户反馈「不要等朗读念到最后才给按」）：
+                  // 序号自增让还在跑的旧轮次在下一个 await 后自行退出，再掐掉朗读、收起面板。
+                  this.callTurnId++;
                   this.callVisible = false;
                   this.callState = 'idle';
                   this.callStatus = '点「说话」，说完自动发送';
-                  // 挂断时把还在念的回复停掉，否则离开面板后声音还在继续。
                   const context: common.UIAbilityContext =
                     this.getUIContext().getHostContext() as common.UIAbilityContext;
                   HostCapabilities.stopSpeakForCall(context);
@@ -744,7 +855,7 @@ struct Index {
             }
             .margin({ top: 4 })
 
-            Text('半双工：说完自动发送，等回复念完再点「说话」继续')
+            Text('半双工：说完自动发送；读取回复时可点「停止朗读」或直接「打断并说话」，随时能挂断')
               .fontSize(11)
               .fontColor('#999999')
               .textAlign(TextAlign.Center)
