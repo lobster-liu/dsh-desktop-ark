@@ -16,8 +16,15 @@ export class Constants {
   static readonly START_TIMEOUT_MS: number = 60000;
   static readonly PROBE_RETRIES: number = 20;
   static readonly PROBE_INTERVAL_MS: number = 500;
-  /** 就绪公告（ready.json）的有界重试：线程存活 ≠ 业务就绪 */
-  static readonly READY_RETRIES: number = 20;
+  /**
+   * 就绪公告（ready.json）的有界重试：线程存活 ≠ 业务就绪。
+   *
+   * 首次安装或换载荷（sha12 变了）时，bootstrap 要先解包 ~340MB 的 dsh.tar.gz
+   * （约 2 万文件），实测 20~40 秒才写出 phase=ready。原先 20×500ms（10 秒）
+   * 的预算会把「正在解包」误判成「启动失败」，页面就停在 FAILED 浮层。
+   * 这里放宽到 240×500ms（120 秒），仍是有界等待。
+   */
+  static readonly READY_RETRIES: number = 240;
   static readonly READY_INTERVAL_MS: number = 500;
   /** 宿主桥信箱轮询间隔 */
   static readonly MAILBOX_POLL_MS: number = 100;

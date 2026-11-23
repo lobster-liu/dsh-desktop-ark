@@ -19,6 +19,10 @@ signing.*.local.json
 # 本机部署脚本（含设备序列号、签名口令，绝不入库）
 scripts/*.local.ps1
 
+# 本地签名产物（每次装机都会重新生成）
+sign-work/
+*.hap
+
 # 编辑器与系统
 .DS_Store
 .idea/

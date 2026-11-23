@@ -151,3 +151,21 @@
     # 系统返回 seam（113-system-back）：Web UI 内设置页/弹窗关闭、抽屉收回、首页/会话页无操作。
     - id: back-ohos
       name: '@dsh-ohos/back'
+
+    # ── 语音输入（ASR）────────────────────────────────────────────────────────
+    # 上游 `dsh-experimental-voice-input-bundle` 的 patch 会把服务 + SenseVoice +
+    # API + 客户端 UI 一起插入，但它默认的 `sensevoice-local` 需要 `sherpa-onnx-node`
+    # 的原生 `.node`，而 sherpa-onnx 没有 OHOS 预编译包（载荷里只有 .js）⇒ 在手机上
+    # 必然加载失败。这里只复用上游的三件套（服务 / API / 前端录音 UI），provider
+    # 换成系统自带的离线识别（`@kit.CoreSpeechKit` speechRecognizer），经宿主桥
+    # `speech.recognize` 调用，不下载模型、不需要原生扩展。
+    - id: speech-to-text
+      name: '@deepseek-ai/dsh-experimental-speech-to-text'
+      config:
+        defaultProvider: ohos-local
+    - id: speech-to-text-ohos
+      name: '@dsh-ohos/speech-to-text'
+    - id: api-speech-to-text
+      name: '@deepseek-ai/dsh-experimental-api-speech-to-text'
+    - id: ui-voice-input
+      name: '@deepseek-ai/dsh-experimental-client-ui-voice-input'

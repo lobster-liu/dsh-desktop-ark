@@ -97,6 +97,14 @@
         "name": "ohos.permission.CUSTOM_SCREEN_CAPTURE",
         "reason": "$string:screen_capture",
         "usedScene": { "abilities": ["EntryAbility"], "when": "inuse" }
+      },
+      // 语音输入：ArkWeb 页面的 getUserMedia 与宿主侧的 speechRecognizer 都要它。
+      // 只声明还不够 —— 页面侧还需 Index.ets 的 onPermissionRequest 放行资源，
+      // 否则 composer 会显示「麦克风权限未开启，请在浏览器和系统设置中允许访问。」
+      {
+        "name": "ohos.permission.MICROPHONE",
+        "reason": "$string:microphone",
+        "usedScene": { "abilities": ["EntryAbility"], "when": "inuse" }
       }
       // ── 受限开放权限（需 ACL，Profile 必须授权，否则装机即拒）────────────────────
       // 119-jitless：JIT 权限只属于 `jit` 形态；标记之间的内容由 `scripts/set-node-mode.mjs`

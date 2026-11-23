@@ -4,6 +4,8 @@ import { fileIo as fs, picker } from '@kit.CoreFileKit';
 import { image } from '@kit.ImageKit';
 import { util } from '@kit.ArkTS';
 import { hilog } from '@kit.PerformanceAnalysisKit';
+import { speechRecognizer, textToSpeech } from '@kit.CoreSpeechKit';
+import { audio } from '@kit.AudioKit';
 import { HostBridge } from '@fellow99/node-bridge';
 import { Constants } from '../common/Constants';
 import { resolve as resolveNodeMode } from '../common/NodeMode';
@@ -55,6 +57,114 @@ interface PickFolderResult {
   cancelled: boolean;
   probes: FolderProbe[];
   error?: string;
+}
+
+/**
+ * `speech.recognize` 入参：`path` 指向 **PCM16 / 16 kHz / 单声道** 裸数据文件。
+ *
+ * 为什么走文件而不是把音频塞进 JSON：一次 30 秒录音是 ~960 KB 的 PCM，
+ * base64 后 1.3 MB 会让信箱里的单个请求文件过大；写文件再把路径交给 ArkTS 更稳。
+ */
+interface SpeechRecognizeArgs {
+  path?: string;
+  language?: string;
+}
+
+interface SpeechRecognizeResult {
+  ok: boolean;
+  text?: string;
+  error?: string;
+  code?: string;
+  hint?: string;
+}
+
+/** `speech.micTest` 入参：抓多久、用哪种采样率。 */
+interface MicTestArgs {
+  durationMs?: number;
+  sampleRate?: number;
+}
+
+/** `speech.micTest` 结果：样本层面的证据（frames > 0 且 samples > 0 才算真拿到音频）。 */
+interface MicTestResult {
+  ok: boolean;
+  frames: number;
+  samples: number;
+  peak: number;
+  rms: number;
+  error?: string;
+  code?: string;
+}
+
+/** `speech.record` 入参：录多久（毫秒），或「说多久录多久」。 */
+interface RecordArgs {
+  durationMs?: number;
+  mode?: string;
+  /** 自适应模式：说到停顿就自动停（默认开启）。 */
+  autoStop?: boolean;
+  /** 最长录多久（默认 30000ms，上限 120000ms）。 */
+  maxMs?: number;
+  /** 说完多久没声音就停（默认 900ms）。 */
+  silenceMs?: number;
+  /** 至少检测到这么多毫秒的人声才允许自动停（默认 400ms）。 */
+  minVoicedMs?: number;
+  /** 人声判定阈值（RMS，0-32767）；不给就按本底噪声自适应。 */
+  threshold?: number;
+}
+
+/** 一次录音的停止原因：说完自动停 / 到了时长上限 / 字节上限。 */
+interface CaptureOptions {
+  autoStop: boolean;
+  maxMs: number;
+  silenceMs: number;
+  minVoicedMs: number;
+  threshold: number;
+}
+
+/** `speech.record` 结果：PCM 文件落在应用沙箱里。 */
+interface RecordResult {
+  ok: boolean;
+  input?: string;
+  path?: string;
+  bytes?: number;
+  durationMs?: number;
+  sampleRate?: number;
+  peak?: number;
+  rms?: number;
+  /** 停下来的原因：silence（说完）/ max（到上限）/ bytes（到字节上限）。 */
+  stopReason?: string;
+  /** 检测到人声的累计毫秒。 */
+  voicedMs?: number;
+  error?: string;
+  code?: string;
+}
+
+/** `speech.speak` 入参：要朗读的文本与语音参数。 */
+interface SpeakArgs {
+  text?: string;
+  speed?: number;
+  volume?: number;
+  pitch?: number;
+  lang?: string;
+}
+
+/** `speech.speak` 结果：朗读结束（或失败）时返回。 */
+/** 一次录音的结果统计（内部用）。 */
+interface CaptureStats {
+  bytes: number;
+  peak: number;
+  rms: number;
+  rate: number;
+  /** silence / max / bytes。 */
+  stopReason: string;
+  voicedMs: number;
+  totalMs: number;
+}
+interface SpeakResult {
+  ok: boolean;
+  chars?: number;
+  estimateMs?: number;
+  error?: string;
+  code?: string;
 }
 
 /** `image.normalize` 入参（与 `packages/attachment-image-ohos` 的调用面一致） */
@@ -165,6 +275,26 @@ interface RuntimeFacts {
  */
 export class HostCapabilities {
   /**
+   * 系统语音识别对 `writeAudio` 的硬约束：每次只能 640 或 1280 字节，且按 20/40 ms 的节奏送；
+   * 一次性灌整个录音会被服务端判成 `1002200004 Finish recognition failed`。
+   */
+  private static readonly SPEECH_CHUNK_BYTES: number = 640;
+  private static readonly SPEECH_CHUNK_PACE_MS: number = 20;
+
+  /**
+   * 蓝牙麦探测缓存。
+   *
+   * 系统会把所有配对过的 SCO 设备都列出来，逐个试 1.2 秒；真机上这几台全静音（系统不给
+   * 第三方 App 耳机麦），于是每轮白等 3.6 秒。全静音后 10 分钟内直接走手机麦。
+   */
+  private static btSilentUntil: number = 0;
+
+  private static delay(ms: number): Promise<void> {
+    return new Promise<void>((resolve: () => void) => {
+      setTimeout(resolve, ms);
+    });
+  }
+  /**
    * 注册全部能力（重复注册同名会覆盖，库的注册表语义）。
    * @param host - 库提供的宿主桥
    * @param context - UIAbility 上下文
@@ -182,6 +312,14 @@ export class HostCapabilities {
     host.register('fs.pickFiles', (args: string): Promise<string> => HostCapabilities.pickFiles(context, args));
     // 目录选择：手机形态能否选中「文档」下的某个文件夹并直接当工作区用，见 pickFolder 注释。
     host.register('fs.pickFolder', (args: string): Promise<string> => HostCapabilities.pickFolder(context, args));
+    // 语音转写：DSH 的 speech provider 把录音写成 PCM 文件，这里交给系统离线识别引擎。
+    host.register('speech.recognize', (args: string): Promise<string> => HostCapabilities.recognizeSpeech(context, args));
+    host.register('speech.micTest', (args: string): Promise<string> => HostCapabilities.micTest(context, args));
+    // 通话录音：把麦克风 PCM 直接写进沙箱文件，随后交给 speech.recognize。
+    host.register('speech.record', (args: string): Promise<string> => HostCapabilities.record(context, args));
+    // 语音合成：半双工通话里把模型的回复念出来（系统离线 TTS）。
+    host.register('speech.speak', (args: string): Promise<string> => HostCapabilities.speak(context, args));
+    host.register('speech.speakStop', (args: string): Promise<string> => HostCapabilities.stopSpeak());
 
     // 已注册但未实现：显式返回 not-implemented（宪法 C2）。
     HostCapabilities.notImplemented(host, 'fs.saveFile', '导出将在 P2 提供');
@@ -328,6 +466,812 @@ export class HostCapabilities {
       }
     } catch (e) {
       // 诊断写入失败不能影响能力调用
+    }
+  }
+
+  /**
+   * 系统离线语音识别（`@kit.CoreSpeechKit` 的 `speechRecognizer`）。
+   *
+   * 为什么不用随包的 SenseVoice：`sherpa-onnx-node` 只为 darwin/linux/win 发布
+   * 原生 `.node`，没有 OHOS 版本；libnode 里 `require()` 必然失败。系统引擎是设备
+   * 自带的离线模型（目前只支持 `zh-CN`），不需要下载 239 MB 权重。
+   *
+   * 音频契约：`path` 指向 PCM16 / 16000 Hz / 单声道裸数据（无 WAV 头），
+   * 由 Node 侧 `@dsh-ohos/speech-to-text` 剥头后落盘。
+   */
+  /**
+   * 麦克风自检：用 ArkTS `AudioCapturer` 直接抓一小段 PCM，报告帧数与峰值。
+   *
+   * 为什么要单独试一次：ArkWeb 的 `getUserMedia` 在这台设备上会走到
+   * `AudioCapturer` 创建失败（hilog `CapturerInClientInner: Init stream failed: -62980116`），
+   * 拿到的 track 立刻 `ended`，前端 `MediaRecorder.start()` 直接 `NotSupportedError`。
+   * 只有用 ArkTS 侧独立抓一次，才能判断是「ArkWeb 的参数不被接受」还是
+   * 「应用域根本拿不到麦克风」——两者的修法完全不同。
+   */
+  private static async micTest(context: common.UIAbilityContext, args: string): Promise<string> {
+    let durationMs: number = 1500;
+    let useSixteenKilo: boolean = false;
+    try {
+      const parsed: MicTestArgs = JSON.parse(args.length > 0 ? args : '{}') as MicTestArgs;
+      if (typeof parsed.durationMs === 'number' && parsed.durationMs > 0) {
+        durationMs = Math.min(parsed.durationMs, 5000);
+      }
+      useSixteenKilo = parsed.sampleRate === 16000;
+    } catch (error) {
+      const ignored: BusinessError = error as BusinessError;
+      console.info(`[${Constants.HILOG_TAG}] speech.micTest 参数解析失败：${ignored.message}`);
+    }
+    const allowed: boolean = await HostCapabilities.ensureMicrophone(context);
+    if (!allowed) {
+      const denied: MicTestResult = {
+        ok: false, frames: 0, samples: 0, peak: 0, rms: 0,
+        error: 'microphone-permission', code: 'permission'
+      };
+      return JSON.stringify(denied);
+    }
+    const streamInfo: audio.AudioStreamInfo = {
+      samplingRate: useSixteenKilo ? audio.AudioSamplingRate.SAMPLE_RATE_16000 : audio.AudioSamplingRate.SAMPLE_RATE_48000,
+      channels: audio.AudioChannel.CHANNEL_1,
+      sampleFormat: audio.AudioSampleFormat.SAMPLE_FORMAT_S16LE,
+      encodingType: audio.AudioEncodingType.ENCODING_TYPE_RAW
+    };
+    const capturerInfo: audio.AudioCapturerInfo = {
+      source: audio.SourceType.SOURCE_TYPE_MIC,
+      capturerFlags: 0
+    };
+    const options: audio.AudioCapturerOptions = { streamInfo, capturerInfo };
+    let capturer: audio.AudioCapturer | null = null;
+    let frames: number = 0;
+    let samples: number = 0;
+    let peak: number = 0;
+    let sumSquares: number = 0;
+    try {
+      capturer = await audio.createAudioCapturer(options);
+      capturer.on('readData', (buffer: ArrayBuffer): void => {
+        frames += 1;
+        const view: Int16Array = new Int16Array(buffer);
+        samples += view.length;
+        for (let i = 0; i < view.length; i++) {
+          const value: number = view[i] / 32768;
+          const magnitude: number = Math.abs(value);
+          if (magnitude > peak) {
+            peak = magnitude;
+          }
+          sumSquares += value * value;
+        }
+      });
+      await capturer.start();
+      await new Promise<void>((resolve: () => void): void => {
+        setTimeout(resolve, durationMs);
+      });
+      await capturer.stop();
+      const rms: number = samples > 0 ? Math.sqrt(sumSquares / samples) : 0;
+      const result: MicTestResult = {
+        ok: samples > 0, frames, samples,
+        peak: Math.round(peak * 10000) / 10000,
+        rms: Math.round(rms * 10000) / 10000
+      };
+      console.info(`[${Constants.HILOG_TAG}] speech.micTest frames=${frames} samples=${samples} peak=${result.peak}`);
+      return JSON.stringify(result);
+    } catch (error) {
+      const failed: BusinessError = error as BusinessError;
+      const result: MicTestResult = {
+        ok: false, frames, samples, peak: 0, rms: 0,
+        error: failed.message, code: String(failed.code)
+      };
+      console.error(`[${Constants.HILOG_TAG}] speech.micTest 失败：${failed.code} ${failed.message}`);
+      return JSON.stringify(result);
+    } finally {
+      if (capturer !== null) {
+        try {
+          capturer.release();
+        } catch (error) {
+          const ignored: BusinessError = error as BusinessError;
+          console.info(`[${Constants.HILOG_TAG}] speech.micTest release 失败：${ignored.message}`);
+        }
+      }
+    }
+  }
+
+  /**
+   * 通话录音：录 `durationMs` 毫秒的单声道 16 kHz PCM16，写进 `<filesDir>/runtime/call-<ts>.pcm`。
+   *
+   * 为什么由 ArkTS 录而不是复用页面的 `MediaRecorder`：半双工通话的状态机在 ArkTS 侧
+   * （`Index.ets` 的通话面板），录音结果要立刻交给系统识别引擎；页面侧录音还需要把
+   * base64 传回宿主，多一次大块拷贝。这里录完直接给 `speech.recognize` 一个文件路径。
+   */
+  private static async record(context: common.UIAbilityContext, args: string): Promise<string> {
+    try {
+      await HostCapabilities.ensureMicrophone(context);
+      const parsed: RecordArgs = JSON.parse(args) as RecordArgs;
+      // 「说多久录多久」：maxMs 只是安全上限，真正的收尾靠静音检测。
+      const maxMs: number = Math.min(Math.max(parsed.maxMs ?? parsed.durationMs ?? 30000, 1000), 120000);
+      const options: CaptureOptions = {
+        autoStop: parsed.autoStop ?? true,
+        maxMs: maxMs,
+        silenceMs: Math.min(Math.max(parsed.silenceMs ?? 900, 300), 4000),
+        minVoicedMs: Math.min(Math.max(parsed.minVoicedMs ?? 400, 100), 4000),
+        threshold: Math.max(parsed.threshold ?? 0, 0)
+      };
+      const runtimeDir: string = `${context.filesDir}/runtime`;
+      if (!fs.accessSync(runtimeDir)) {
+        fs.mkdirSync(runtimeDir);
+      }
+      const path: string = `${runtimeDir}/call-${Date.now()}.pcm`;
+      const candidates: audio.AudioDeviceDescriptor[] = HostCapabilities.inputCandidates(context);
+      const mode: string = parsed.mode ?? '';
+      if (mode !== '') {
+        return await HostCapabilities.recordTrial(context, path, maxMs, candidates, mode);
+      }
+      const phones: audio.AudioDeviceDescriptor[] = HostCapabilities.pickDevices(candidates, false);
+      const bluetooths: audio.AudioDeviceDescriptor[] = HostCapabilities.pickDevices(candidates, true);
+      // 系统会把「已配对过的所有 SCO 设备」都列出来（真机一次列出 3 个：眼镜、耳机、车机），
+      // 默认路由经常落到不存在的那个上 → 录到静音。所以逐个短探 1.2s，谁有声音就用谁。
+      let bluetooth: audio.AudioDeviceDescriptor | null = null;
+      if (bluetooths.length > 0 && Date.now() >= HostCapabilities.btSilentUntil) {
+        for (let i = 0; i < bluetooths.length; i++) {
+          const stats: CaptureStats = await HostCapabilities.captureToFile(context, path, 1200, bluetooths[i],
+            audio.SourceType.SOURCE_TYPE_VOICE_COMMUNICATION);
+          HostCapabilities.appLog(context,
+            `speech.record 蓝牙探测 id=${bluetooths[i].id} peak=${stats.peak}`);
+          if (stats.peak >= 300) {
+            bluetooth = bluetooths[i];
+            break;
+          }
+        }
+        if (bluetooth === null) {
+          HostCapabilities.btSilentUntil = Date.now() + 600000;
+          HostCapabilities.appLog(context, 'speech.record 蓝牙麦全部静音（系统不给第三方 App 耳机麦），10 分钟内直接用手机麦');
+        }
+      }
+      let stats: CaptureStats;
+      let input: string;
+      if (bluetooth !== null) {
+        stats = await HostCapabilities.captureSpeech(context, path, options, bluetooth,
+          audio.SourceType.SOURCE_TYPE_VOICE_COMMUNICATION);
+        input = 'bluetooth';
+      } else {
+        // 蓝牙都没声音就用手机麦；用「语音识别」采集源，系统会做降噪/AGC，识别更稳。
+        stats = await HostCapabilities.captureSpeech(context, path, options,
+          phones.length > 0 ? phones[0] : null, audio.SourceType.SOURCE_TYPE_VOICE_RECOGNITION);
+        input = 'phone';
+      }
+      const result: RecordResult = {
+        ok: stats.bytes > 0,
+        path: path,
+        bytes: stats.bytes,
+        durationMs: stats.totalMs,
+        sampleRate: stats.rate,
+        peak: stats.peak,
+        rms: stats.rms,
+        input: input,
+        stopReason: stats.stopReason,
+        voicedMs: stats.voicedMs
+      };
+      HostCapabilities.appLog(context,
+        `speech.record done: ${stats.bytes}B ${stats.totalMs}ms stop=${stats.stopReason} voiced=${stats.voicedMs}ms rate=${stats.rate} peak=${stats.peak} rms=${stats.rms} input=${input} -> ${path}`);
+      return JSON.stringify(result);
+    } catch (error) {
+      const failed: BusinessError = error as BusinessError;
+      const result: RecordResult = { ok: false, error: failed.message, code: String(failed.code) };
+      HostCapabilities.appLog(context, `speech.record failed: ${failed.code} ${failed.message}`);
+      return JSON.stringify(result);
+    }
+  }
+
+  /** 列出通话输入设备（`CALL_INPUT_DEVICES` 才含带麦的蓝牙设备；`MEDIA_*` 只有 A2DP 放音）。 */
+  private static inputCandidates(context: common.UIAbilityContext): audio.AudioDeviceDescriptor[] {
+    const out: audio.AudioDeviceDescriptor[] = [];
+    try {
+      const inputs: audio.AudioDeviceDescriptors = audio.getAudioManager().getRoutingManager()
+        .getAvailableDevices(audio.DeviceUsage.CALL_INPUT_DEVICES);
+      for (let i = 0; i < inputs.length; i++) {
+        const device: audio.AudioDeviceDescriptor = inputs[i];
+        out.push(device);
+        HostCapabilities.appLog(context, `speech.record 输入候选 type=${device.deviceType} id=${device.id}`);
+      }
+    } catch (error) {
+      const ignored: BusinessError = error as BusinessError;
+      console.info(`[${Constants.HILOG_TAG}] 查询输入设备失败：${ignored.message}`);
+    }
+    return out;
+  }
+
+  /** 按类型筛设备：蓝牙（SCO，可能多个）或手机麦（MIC）。 */
+  private static pickDevices(devices: audio.AudioDeviceDescriptor[],
+    wantBluetooth: boolean): audio.AudioDeviceDescriptor[] {
+    const target: audio.DeviceType = wantBluetooth ? audio.DeviceType.BLUETOOTH_SCO : audio.DeviceType.MIC;
+    const out: audio.AudioDeviceDescriptor[] = [];
+    for (let i = 0; i < devices.length; i++) {
+      if (devices[i].deviceType === target) {
+        out.push(devices[i]);
+      }
+    }
+    return out;
+  }
+
+  /** 只要一个设备时用（诊断模式沿用旧的单设备入口）。 */
+  private static pickDevice(devices: audio.AudioDeviceDescriptor[],
+    wantBluetooth: boolean): audio.AudioDeviceDescriptor | null {
+    const list: audio.AudioDeviceDescriptor[] = HostCapabilities.pickDevices(devices, wantBluetooth);
+    return list.length > 0 ? list[0] : null;
+  }
+  /** 列出通话输入设备（`CALL_INPUT_DEVICES` 才含带麦的蓝牙设备；`MEDIA_*` 只有 A2DP 放音）。 */
+  /** 诊断用：按不同「设备 × 采集源」组合录一段，比较峰值，判断蓝牙麦到底走哪条路。 */
+  private static async recordTrial(context: common.UIAbilityContext, path: string, durationMs: number,
+    candidates: audio.AudioDeviceDescriptor[], mode: string): Promise<string> {
+    const bluetooth: audio.AudioDeviceDescriptor | null = HostCapabilities.pickDevice(candidates, true);
+    const phone: audio.AudioDeviceDescriptor | null = HostCapabilities.pickDevice(candidates, false);
+    let device: audio.AudioDeviceDescriptor | null = null;
+    let source: audio.SourceType = audio.SourceType.SOURCE_TYPE_MIC;
+    if (mode === 'bt-explicit') {
+      device = bluetooth;
+      source = audio.SourceType.SOURCE_TYPE_VOICE_COMMUNICATION;
+    } else if (mode === 'bt-auto') {
+      device = null;
+      source = audio.SourceType.SOURCE_TYPE_VOICE_COMMUNICATION;
+    } else if (mode === 'phone-explicit') {
+      device = phone;
+      source = audio.SourceType.SOURCE_TYPE_MIC;
+    }
+    const stats: CaptureStats = await HostCapabilities.captureToFile(context, path, durationMs, device, source);
+    HostCapabilities.appLog(context,
+      `speech.trial mode=${mode} peak=${stats.peak} rms=${stats.rms} rate=${stats.rate}`);
+    const result: RecordResult = {
+      ok: stats.bytes > 0, path: path, bytes: stats.bytes, durationMs: durationMs,
+      sampleRate: stats.rate, peak: stats.peak, rms: stats.rms, input: mode
+    };
+    return JSON.stringify(result);
+  }
+
+  /** 录一段固定时长的 PCM 到文件（探测蓝牙麦这类内部用途）。 */
+  private static async captureToFile(context: common.UIAbilityContext, path: string, durationMs: number,
+    device: audio.AudioDeviceDescriptor | null, source: audio.SourceType): Promise<CaptureStats> {
+    const fixed: CaptureOptions = {
+      autoStop: false,
+      maxMs: durationMs,
+      silenceMs: 900,
+      minVoicedMs: 400,
+      threshold: 0
+    };
+    return await HostCapabilities.captureSpeech(context, path, fixed, device, source);
+  }
+
+  /**
+   * 录 PCM，直到「说完」或到上限。
+   *
+   * 用户的原话是「录音长短的问题」：固定 6 秒必然把一句话的后半截截掉、或者白等 4 秒静音。
+   * 这里按块算 RMS，检测到人声后一旦静音超过 silenceMs 就收尾；阈值不写死，跟着本底噪声走，
+   * 否则安静房间里的呼吸声、吵闹环境里的底噪都会让判定失灵。
+   */
+  private static async captureSpeech(context: common.UIAbilityContext, path: string,
+    options: CaptureOptions,
+    device: audio.AudioDeviceDescriptor | null, source: audio.SourceType): Promise<CaptureStats> {
+    const target: fs.File = fs.openSync(path, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+    let capturer: audio.AudioCapturer | null = null;
+    let bytes: number = 0;
+    let peak: number = 0;
+    let sumSquares: number = 0;
+    let samples: number = 0;
+    let voicedMs: number = 0;
+    let silenceRunMs: number = 0;
+    let noiseFloor: number = 80;
+    let stopReason: string = 'max';
+    let done: boolean = false;
+    let totalMs: number = 0;
+    try {
+      const recorder: audio.AudioCapturer = await audio.createAudioCapturer({
+        streamInfo: {
+          samplingRate: 16000,
+          channels: audio.AudioChannel.CHANNEL_1,
+          sampleFormat: audio.AudioSampleFormat.SAMPLE_FORMAT_S16LE,
+          encodingType: audio.AudioEncodingType.ENCODING_TYPE_RAW
+        },
+        capturerInfo: {
+          source: source,
+          capturerFlags: 0
+        }
+      });
+      capturer = recorder;
+      if (device !== null) {
+        await audio.getAudioManager().getDeviceEnhanceManager().selectInputDeviceForAudioCapturer(recorder, device);
+        HostCapabilities.appLog(context, 'speech.record 输入设备 type=' + device.deviceType);
+      }
+      // 设备不一定按请求的 16 kHz 出流（多数手机原生 48 kHz）。识别引擎按 16 kHz 解读 PCM，
+      // 若实际采样率更高而原样落盘，音频在引擎里会被「快放」，结果就是 0 个字。
+      const streamInfo: audio.AudioStreamInfo = recorder.getStreamInfoSync();
+      const rate: number = streamInfo.samplingRate;
+      const ratio: number = rate > 16000 ? Math.round(rate / 16000) : 1;
+      const limit: number = 16000 * 2 * 120;
+      recorder.on('readData', (buffer: ArrayBuffer): void => {
+        if (done || bytes >= limit) {
+          return;
+        }
+        try {
+          let chunk: ArrayBuffer = buffer;
+          if (ratio > 1) {
+            const input: Int16Array = new Int16Array(buffer);
+            const outLength: number = Math.floor(input.length / ratio);
+            const output: Int16Array = new Int16Array(outLength);
+            for (let i = 0; i < outLength; i++) {
+              output[i] = input[i * ratio];
+            }
+            chunk = output.buffer as ArrayBuffer;
+          }
+          const view: Int16Array = new Int16Array(chunk);
+          let chunkSquares: number = 0;
+          for (let i = 0; i < view.length; i++) {
+            const value: number = view[i];
+            const magnitude: number = value < 0 ? -value : value;
+            if (magnitude > peak) {
+              peak = magnitude;
+            }
+            chunkSquares += value * value;
+            sumSquares += value * value;
+            samples += 1;
+          }
+          fs.writeSync(target.fd, chunk);
+          bytes += chunk.byteLength;
+          totalMs = Math.round((bytes / 32000) * 1000);
+          const chunkMs: number = view.length > 0 ? (view.length / 16000) * 1000 : 0;
+          const chunkRms: number = view.length > 0 ? Math.sqrt(chunkSquares / view.length) : 0;
+          // 阈值跟着本底噪声走：安静时门槛低、吵闹时门槛高，避免环境一变就失灵。
+          if (chunkRms < noiseFloor) {
+            noiseFloor = noiseFloor * 0.7 + chunkRms * 0.3;
+          }
+          const threshold: number = options.threshold > 0 ? options.threshold : Math.max(300, noiseFloor * 3);
+          if (chunkRms >= threshold) {
+            voicedMs += chunkMs;
+            silenceRunMs = 0;
+          } else {
+            silenceRunMs += chunkMs;
+          }
+          if (!options.autoStop) {
+            if (totalMs >= options.maxMs) {
+              stopReason = 'max';
+              done = true;
+            }
+            return;
+          }
+          if (voicedMs >= options.minVoicedMs && silenceRunMs >= options.silenceMs) {
+            stopReason = 'silence';
+            done = true;
+          } else if (voicedMs === 0 && silenceRunMs >= 2500) {
+            // 一句话都没说：别硬等满 30 秒。
+            stopReason = 'empty';
+            done = true;
+          } else if (totalMs >= options.maxMs) {
+            stopReason = 'max';
+            done = true;
+          } else if (bytes >= limit) {
+            stopReason = 'bytes';
+            done = true;
+          }
+        } catch (error) {
+          const ignored: BusinessError = error as BusinessError;
+          console.info(`[${Constants.HILOG_TAG}] speech.record 写入失败：${ignored.message}`);
+        }
+      });
+      await recorder.start();
+      const startedAt: number = Date.now();
+      // 轮询等收尾：readData 在同一个 JS 线程上回调，delay 让出控制权它才会跑。
+      while (!done && Date.now() - startedAt < options.maxMs + 500) {
+        await HostCapabilities.delay(80);
+      }
+      await recorder.stop();
+      const rmsRaw: number = samples > 0 ? Math.sqrt(sumSquares / samples) : 0;
+      const stats: CaptureStats = {
+        bytes: bytes,
+        peak: peak,
+        rms: Math.round(rmsRaw * 10) / 10,
+        rate: rate,
+        stopReason: stopReason,
+        voicedMs: Math.round(voicedMs),
+        totalMs: totalMs
+      };
+      HostCapabilities.appLog(context,
+        `speech.capture 收尾 reason=${stopReason} total=${totalMs}ms voiced=${Math.round(voicedMs)}ms noise=${Math.round(noiseFloor)}`);
+      return stats;
+    } finally {
+      if (capturer !== null) {
+        try {
+          capturer.release();
+        } catch (error) {
+          const ignored: BusinessError = error as BusinessError;
+          console.info(`[${Constants.HILOG_TAG}] speech.record release 失败：${ignored.message}`);
+        }
+      }
+      try {
+        fs.closeSync(target);
+      } catch (error) {
+        const ignored: BusinessError = error as BusinessError;
+        console.info(`[${Constants.HILOG_TAG}] speech.record close 失败：${ignored.message}`);
+      }
+    }
+  }
+
+  /**
+   * 语音合成：用系统离线 TTS 朗读一段文本，读到 `onComplete` 才返回。
+   * 入参 `{text, speed?, volume?, pitch?, lang?}`；空文本直接返回成功（调用方通常已过滤）。
+   * 用于半双工通话：模型回复 → 这里 → 扬声器。
+   */
+  /** 复用的 TTS 引擎。每次朗读都 create/shutdown 会把长文本截断（真机现象：只读半句）。 */
+  private static ttsEngine: textToSpeech.TextToSpeechEngine | null = null;
+  private static ttsLanguage: string = '';
+
+  private static async ensureTtsEngine(language: string): Promise<textToSpeech.TextToSpeechEngine> {
+    const cached: textToSpeech.TextToSpeechEngine | null = HostCapabilities.ttsEngine;
+    if (cached !== null && HostCapabilities.ttsLanguage === language) {
+      return cached;
+    }
+    if (cached !== null) {
+      try {
+        cached.shutdown();
+      } catch (error) {
+        const ignored: BusinessError = error as BusinessError;
+        console.info(`[${Constants.HILOG_TAG}] 旧 TTS 引擎关闭失败：${ignored.message}`);
+      }
+      HostCapabilities.ttsEngine = null;
+    }
+    const created: textToSpeech.TextToSpeechEngine =
+      await textToSpeech.createEngine({ language: language, person: 0, online: 1 });
+    HostCapabilities.ttsEngine = created;
+    HostCapabilities.ttsLanguage = language;
+    return created;
+  }
+
+  /** 打断当前朗读（挂断/静音时用）。 */
+  private static async stopSpeak(): Promise<string> {
+    const engine: textToSpeech.TextToSpeechEngine | null = HostCapabilities.ttsEngine;
+    if (engine !== null) {
+      try {
+        engine.stop();
+      } catch (error) {
+        const ignored: BusinessError = error as BusinessError;
+        console.info(`[${Constants.HILOG_TAG}] speech.speak stop 失败：${ignored.message}`);
+      }
+    }
+    const ok: SpeakResult = { ok: true, chars: 0 };
+    return JSON.stringify(ok);
+  }
+
+  private static async speak(context: common.UIAbilityContext, args: string): Promise<string> {
+    let engine: textToSpeech.TextToSpeechEngine | null = null;
+    try {
+      const parsed: SpeakArgs = JSON.parse(args) as SpeakArgs;
+      const text: string = (parsed.text ?? '').trim();
+      if (text === '') {
+        const empty: SpeakResult = { ok: true, chars: 0 };
+        return JSON.stringify(empty);
+      }
+      const language: string = parsed.lang !== undefined && parsed.lang.startsWith('en') ? 'en-US' : 'zh-CN';
+      // 复用引擎：每次 create/shutdown 会把长文本截断（真机只读半句）。
+      engine = await HostCapabilities.ensureTtsEngine(language);
+      const target: textToSpeech.TextToSpeechEngine = engine;
+      const requestId: string = 'dsh-speak-' + Date.now();
+      const startedAt: number = Date.now();
+      let failure: string = '';
+      let settled: boolean = false;
+      const finished = new Promise<void>((resolve) => {
+        const done = () => {
+          if (!settled) {
+            settled = true;
+            resolve();
+          }
+        };
+        target.setListener({
+          onStart: (_id: string, _response: textToSpeech.StartResponse): void => {
+            HostCapabilities.appLog(context, `speech.speak onStart +${Date.now() - startedAt}ms`);
+          },
+          onComplete: (_id: string, _response: textToSpeech.CompleteResponse): void => {
+            HostCapabilities.appLog(context, `speech.speak onComplete +${Date.now() - startedAt}ms`);
+            done();
+          },
+          onStop: (_id: string, _response: textToSpeech.StopResponse): void => {
+            HostCapabilities.appLog(context, `speech.speak onStop +${Date.now() - startedAt}ms`);
+            done();
+          },
+          onError: (_id: string, errorCode: number, errorMessage: string): void => {
+            failure = errorCode + ' · ' + errorMessage;
+            HostCapabilities.appLog(context, `speech.speak onError +${Date.now() - startedAt}ms ${failure}`);
+            done();
+          }
+        });
+      });
+      // speed/volume/pitch 必须是数字：传字符串时原生侧 GetValueInt64 失败，
+      // 引擎会提前报 onComplete（真机：只读半句就停）。
+      const params: textToSpeech.SpeakParams = {
+        requestId: requestId,
+        extraParams: {
+          'speed': parsed.speed ?? 1,
+          'volume': parsed.volume ?? 2,
+          'pitch': parsed.pitch ?? 1,
+          'languageContext': language
+        }
+      };
+            target.speak(text, params);
+      // 引擎的 onComplete 会提前（实测 143 字在 +1.4s 就报完成，真音频约 30s，之后还会再来一次
+      // 「迟到」的 onComplete），所以只等一小段时间捞「立刻失败」，朗读时长按字数估算交给调用方。
+      await Promise.race([finished, HostCapabilities.delay(800)]);
+      if (failure !== '') {
+        HostCapabilities.appLog(context, 'speech.speak failed: ' + failure);
+        const bad: SpeakResult = { ok: false, error: failure, code: 'speak-failed' };
+        return JSON.stringify(bad);
+      }
+      HostCapabilities.appLog(context, 'speech.speak done: ' + text.length + ' chars');
+      const estimateMs: number = Math.max(1500, Math.round(text.length / 4.5 * 1000));
+      HostCapabilities.appLog(context, 'speech.speak estimate ' + estimateMs + 'ms for ' + text.length + ' chars');
+      const ok: SpeakResult = { ok: true, chars: text.length, estimateMs: estimateMs };
+      return JSON.stringify(ok);
+    } catch (error) {
+      const failed: BusinessError = error as BusinessError;
+      HostCapabilities.appLog(context, 'speech.speak error: ' + failed.message);
+      const bad: SpeakResult = { ok: false, error: failed.message, code: String(failed.code) };
+      return JSON.stringify(bad);
+    } finally {
+      // 故意不 shutdown：引擎留着下一次复用。之前每轮都 shutdown，长回复会在
+      // 第一段合成后被打断（真机现象：只读完半句就停）。
+    }
+  }
+
+  /**
+   * 给 ArkTS 页面（通话面板）用的直调入口：录音 / 识别 / 朗读。
+   *
+   * 页面在 ArkTS 侧，不走宿主桥的 JSON 字符串协议，所以这里给一层类型化的薄包装。
+   */
+  static async recordForCall(context: common.UIAbilityContext, maxMs: number): Promise<RecordResult> {
+    // autoStop：说话一停就收尾，maxMs 只当安全上限（面板给 30 秒）。
+    const raw: string = await HostCapabilities.record(context,
+      JSON.stringify({ maxMs: maxMs, autoStop: true, silenceMs: 900, minVoicedMs: 400 }));
+    return JSON.parse(raw) as RecordResult;
+  }
+
+  static async recognizeForCall(context: common.UIAbilityContext, path: string): Promise<SpeechRecognizeResult> {
+    const raw: string = await HostCapabilities.recognizeSpeech(context, JSON.stringify({ path, language: 'zh' }));
+    return JSON.parse(raw) as SpeechRecognizeResult;
+  }
+
+  static async stopSpeakForCall(context: common.UIAbilityContext): Promise<SpeakResult> {
+    const raw: string = await HostCapabilities.stopSpeak();
+    return JSON.parse(raw) as SpeakResult;
+  }
+
+  static async speakForCall(context: common.UIAbilityContext, text: string): Promise<SpeakResult> {
+    const raw: string = await HostCapabilities.speak(context, JSON.stringify({ text, lang: 'zh' }));
+    return JSON.parse(raw) as SpeakResult;
+  }
+
+  private static async recognizeSpeech(context: common.UIAbilityContext, args: string): Promise<string> {
+    let engine: speechRecognizer.SpeechRecognitionEngine | null = null;
+    let fd: number = -1;
+    try {
+      const parsed: SpeechRecognizeArgs = JSON.parse(args) as SpeechRecognizeArgs;
+      const path: string = parsed.path ?? '';
+      if (path === '') {
+        const bad: SpeechRecognizeResult = {
+          ok: false, error: 'bad-args', code: 'bad-args',
+          hint: 'speech.recognize 需要 path（PCM16 / 16 kHz / 单声道裸数据）'
+        };
+        return JSON.stringify(bad);
+      }
+      const allowed: boolean = await HostCapabilities.ensureMicrophone(context);
+      if (!allowed) {
+        const denied: SpeechRecognizeResult = {
+          ok: false, error: '麦克风权限未授予', code: 'mic-denied',
+          hint: '请在系统设置里允许本应用使用麦克风后重试'
+        };
+        HostCapabilities.appLog(context, 'speech.recognize: mic denied');
+        return JSON.stringify(denied);
+      }
+      let size: number = 0;
+      try {
+        size = fs.statSync(path).size;
+      } catch (statError) {
+        const missing: SpeechRecognizeResult = {
+          ok: false, error: '录音文件不可读', code: 'speech-no-audio', hint: '找不到待识别的 PCM 文件'
+        };
+        return JSON.stringify(missing);
+      }
+      if (size <= 0) {
+        const empty: SpeechRecognizeResult = { ok: false, error: '录音为空', code: 'speech-empty' };
+        return JSON.stringify(empty);
+      }
+      HostCapabilities.appLog(context, 'speech.recognize in: ' + size + 'B lang=' + String(parsed.language));
+
+      const created: speechRecognizer.SpeechRecognitionEngine = await speechRecognizer.createEngine({
+        language: 'zh-CN',
+        online: 1,
+        // long 模式比 short 更耐心：不会说两句就判定说完，适合整句/长句。
+        extraParams: { recognizerMode: 'long', locate: 'CN' }
+      });
+      // 必须回填到外层变量：`finally` 里要靠它 shutdown，否则引擎每调一次识别就泄漏一个实例，
+      // 多轮之后新引擎 startListening 会立刻失败（1002200010）。
+      engine = created;
+      const audioInfo: speechRecognizer.AudioInfo = {
+        audioType: 'pcm',
+        sampleRate: 16000,
+        soundChannel: 1,
+        sampleBit: 16
+      };
+      const fileHandle = fs.openSync(path, fs.OpenMode.READ_ONLY);
+      fd = typeof fileHandle === 'number' ? fileHandle : fileHandle.fd;
+      // SDK 契约：每次 writeAudio 只能是 640 或 1280 字节，且按 20/40 ms 的节奏喂；
+      // 一次性塞完会被判成 finish 失败（1002200004）。单次识别上限 60 秒。
+      const chunkSize: number = HostCapabilities.SPEECH_CHUNK_BYTES;
+      const paceMs: number = HostCapabilities.SPEECH_CHUNK_PACE_MS;
+      const maxBytes: number = 16000 * 2 * 60;
+      const buffer: ArrayBuffer = new ArrayBuffer(chunkSize);
+      let read: number = fs.readSync(fd, buffer);
+      let sent: number = 0;
+      let collected: string = '';
+      let sessions: number = 0;
+      // 引擎一段会自己收尾（onComplete），一整个会话装不下长句；收尾时若文件还有剩余，
+      // 就换一个新会话接着喂，把几段文本拼起来才是完整一句（DSH Go 的 HmsStreamingAsr 用同样做法）。
+      while (read > 0 && sent < maxBytes && sessions < 60) {
+        sessions += 1;
+        const sessionId: string = 'dsh-' + Date.now() + '-' + sessions;
+        let interim: string = '';
+        let finalText: string = '';
+        let resolved = false;
+        let started = false;
+        let failure: string = '';
+        let bytesThisSession: number = 0;
+        const finished = new Promise<void>((resolve) => {
+          const wrapper = () => {
+            if (!resolved) {
+              resolved = true;
+              resolve();
+            }
+          };
+          created.setListener({
+            onStart: (_sessionId: string, _eventMessage: string): void => {
+              started = true;
+            },
+            onEvent: (_sessionId: string, _eventCode: number, _eventMessage: string): void => {
+            },
+            onResult: (_sessionId: string, result: speechRecognizer.SpeechRecognitionResult): void => {
+              if (result.result.length === 0) {
+                return;
+              }
+              // isFinal 才是句子边界；isLast 不代表物理收尾（DSH Go 的注释写得很清楚）。
+              if (result.isFinal) {
+                finalText = result.result;
+              } else {
+                interim = result.result;
+              }
+            },
+            onComplete: (_sessionId: string, _eventMessage: string): void => {
+              wrapper();
+            },
+            onError: (_sessionId: string, errorCode: number, errorMessage: string): void => {
+              failure = errorCode + ' · ' + errorMessage;
+              wrapper();
+            }
+          });
+        });
+        created.startListening({ sessionId: sessionId, audioInfo: audioInfo, extraParams: {
+          recognitionMode: 1,
+          maxAudioDuration: 60000,
+          recognizerOption: { enablePartialResult: true }
+        } });
+        // 等 onStart 确认引擎真正启动，避免过早 writeAudio 导致 1002200010
+        let waited: number = 0;
+        while (!started && waited < 3000) {
+          await HostCapabilities.delay(50);
+          waited += 50;
+        }
+        let restarts: number = 0;
+        while (read > 0 && sent < maxBytes) {
+          // 引擎会在检测到说完时自行结束（onComplete），此后继续写会抛 1002200010。
+          if (resolved) {
+            break;
+          }
+          const room: number = Math.min(read, maxBytes - sent);
+          const chunk: Uint8Array = new Uint8Array(buffer.slice(0, room));
+          let attempts: number = 0;
+          let written: boolean = false;
+          while (!written && attempts < 3) {
+            attempts += 1;
+            try {
+              created.writeAudio(sessionId, chunk);
+              written = true;
+            } catch (error) {
+              const failed: BusinessError = error as BusinessError;
+              const message: string = `${failed.code} · ${failed.message}`;
+              if (resolved) {
+                // 会话已由引擎自己收尾，这里不是错误。
+                break;
+              }
+              HostCapabilities.appLog(context, 'speech.recognize writeAudio 失败：' + message);
+              if (message.indexOf('1002200010') < 0 || restarts >= 3) {
+                throw error as Error;
+              }
+              restarts += 1;
+              started = false;
+              created.startListening({ sessionId: sessionId, audioInfo: audioInfo, extraParams: {
+          recognitionMode: 1,
+          maxAudioDuration: 60000,
+          recognizerOption: { enablePartialResult: true }
+        } });
+              let retryWait: number = 0;
+              while (!started && retryWait < 3000) {
+                await HostCapabilities.delay(50);
+                retryWait += 50;
+              }
+            }
+          }
+          if (written) {
+            sent += room;
+            bytesThisSession += room;
+          }
+          await HostCapabilities.delay(paceMs);
+          if (resolved) {
+            break;
+          }
+          read = fs.readSync(fd, buffer);
+        }
+        if (!resolved) {
+          created.finish(sessionId);
+        }
+        await finished;
+        const piece: string = (finalText.length > 0 ? finalText : interim).trim();
+        if (piece.length > 0) {
+          collected += piece;
+        }
+        if (failure !== '') {
+          HostCapabilities.appLog(context, 'speech.recognize 本段错误（已保留文本）：' + failure);
+        }
+        // 这一段一个字节都没喂进去（引擎一启动就收尾）时再循环也没意义，直接收工。
+        if (bytesThisSession === 0) {
+          break;
+        }
+        if (read <= 0 || sent >= maxBytes) {
+          break;
+        }
+      }
+      HostCapabilities.appLog(context,
+        `speech.recognize sent ${sent}B（sessions=${sessions}）`);
+      const text: string = collected.trim();
+      if (text.length > 0) {
+        HostCapabilities.appLog(context, 'speech.recognize out: ' + text.length + ' chars');
+        const done: SpeechRecognizeResult = { ok: true, text: text };
+        return JSON.stringify(done);
+      }
+      HostCapabilities.appLog(context, 'speech.recognize out: 0 chars');
+      const empty: SpeechRecognizeResult = { ok: true, text: '' };
+      return JSON.stringify(empty);
+    } catch (error) {
+      const message: string = error instanceof Error ? error.message : String(error);
+      HostCapabilities.appLog(context, 'speech.recognize error: ' + message);
+      const failed: SpeechRecognizeResult = { ok: false, error: message, code: 'speech-failed' };
+      return JSON.stringify(failed);
+    } finally {
+      if (fd >= 0) {
+        try { fs.closeSync(fd); } catch (closeError) { }
+      }
+      if (engine !== null) {
+        try {
+          engine.shutdown();
+        } catch (shutdownError) {
+          const ignored: BusinessError = shutdownError as BusinessError;
+          console.info(`[${Constants.HILOG_TAG}] speech.recognize shutdown 失败：${ignored.message}`);
+        }
+      }
+    }
+  }
+
+  /** 申请麦克风权限；已授权时不弹窗（`requestPermissionsFromUser` 对已授权项直接返回 0）。 */
+  private static async ensureMicrophone(context: common.UIAbilityContext): Promise<boolean> {
+    try {
+      const manager: abilityAccessCtrl.AtManager = abilityAccessCtrl.createAtManager();
+      const result: PermissionRequestResult =
+        await manager.requestPermissionsFromUser(context, ['ohos.permission.MICROPHONE']);
+      if (result.authResults.length === 0) {
+        return false;
+      }
+      return result.authResults[0] === 0;
+    } catch (error) {
+      return false;
     }
   }
 
