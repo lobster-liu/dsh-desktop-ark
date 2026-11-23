@@ -642,29 +642,16 @@ struct Index {
       // 通话入口：悬浮右上角。透明容器只让按钮接收点击，页面其余部分照常响应。
       if (!this.showOverlay && !this.callVisible) {
         Column() {
-          // 毛玻璃圆。+ 线条话筒（不。emoji，跟随主题色，任何背景上都清楚）
-          Stack({ alignContent: Alignment.Center }) {
-            Circle()
-              .width(46)
-              .height(46)
-              .fill('#00000000')
-              .stroke('#2EFFFFFF')
-              .strokeWidth(1)
-            // 顶部高光带：制造水晶反。
-            Image($r('app.media.ic_phone_line'))
-              .width(28)
-              .height(28)
-              .objectFit(ImageFit.Contain)
-              .draggable(false)
-          }
-          .width(52)
-          .height(52)
-          .clip(true)
-          .borderRadius(26)
-          .backgroundColor('#42FFFFFF')
-          .radialGradient({ center: ['32%', '22%'], radius: '98%', colors: [['#A6FFFFFF', 0.0], ['#33FFFFFF', 0.45], ['#0FFFFFFF', 1.0]] })
-          .border({ width: 1.2, color: '#8CFFFFFF' })
-          .shadow({ radius: 16, color: '#59000000', offsetX: 0, offsetY: 6 })
+          // 透明玻璃球：整个球面（本体渐变 + 左上局部反光斑 + 高光核 + 右下内壁反射 + 描边 + 线条话筒）
+          // 都画在 ic_phone_glass.svg 里，避免 ArkUI 各属性叠加时出现灰杠/不透材质。
+          Image($r('app.media.ic_phone_glass'))
+            .width(52)
+            .height(52)
+            .objectFit(ImageFit.Contain)
+            .draggable(false)
+            .clip(true)
+            .borderRadius(26)
+            .shadow({ radius: 16, color: '#59000000', offsetX: 0, offsetY: 6 })
           .onClick((): void => {
             this.callVisible = true;
             this.callState = 'idle';
