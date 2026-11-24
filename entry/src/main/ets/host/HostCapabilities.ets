@@ -1070,10 +1070,11 @@ export class HostCapabilities {
    *
    * 页面在 ArkTS 侧，不走宿主桥的 JSON 字符串协议，所以这里给一层类型化的薄包装。
    */
-  static async recordForCall(context: common.UIAbilityContext, maxMs: number): Promise<RecordResult> {
-    // autoStop：说话一停就收尾，maxMs 只当安全上限（面板给 30 秒）。
+  static async recordForCall(context: common.UIAbilityContext, maxMs: number, silenceMs: number = 900): Promise<RecordResult> {
+    // autoStop：说话一停就收尾，maxMs 只当安全上限（面板给 30 秒）；
+    // silenceMs 由「语音设置」里的停顿档位决定（快 500 / 普通 900 / 耐心 1800）。
     const raw: string = await HostCapabilities.record(context,
-      JSON.stringify({ maxMs: maxMs, autoStop: true, silenceMs: 900, minVoicedMs: 400 }));
+      JSON.stringify({ maxMs: maxMs, autoStop: true, silenceMs: silenceMs, minVoicedMs: 400 }));
     return JSON.parse(raw) as RecordResult;
   }
 

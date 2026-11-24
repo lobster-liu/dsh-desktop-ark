@@ -7,6 +7,17 @@ import { Constants } from '../common/Constants';
 import { DshRuntime, LaunchPhase, LaunchSnapshot } from '../app/DshRuntime';
 import { Probe } from '../app/Probe';
 import { HostCapabilities } from '../host/HostCapabilities';
+import {
+  CloudVoiceSettings,
+  defaultVoiceSettings,
+  pauseLabel,
+  pauseSilenceMs,
+  readVoiceSettings,
+  recognizerLabel,
+  voiceLabel,
+  VoiceSettings,
+  writeVoiceSettings
+} from '../host/VoiceSettings';
 /** 页面里读回来的会话状态（buildReadScript 的返回结构）。*/
 interface PageReplyState {
   state?: string;
@@ -19,6 +30,7 @@ interface CloudRecognizeReply {
   ok?: boolean;
   text?: string;
   engine?: string;
+  provider?: string;
   credential?: string;
   error?: CloudRecognizeError;
 }
@@ -27,6 +39,19 @@ interface CloudRecognizeReply {
 interface CloudRecognizeError {
   code?: string;
   message?: string;
+}
+
+/** 云端合成任务在页面里的状态。*/
+interface CloudTtsState {
+  state?: string;
+  url?: string;
+  error?: string;
+}
+
+/** 页面音频的播放状态。*/
+interface SpeakPlaybackState {
+  done?: boolean;
+  error?: string;
 }
 
 
@@ -62,6 +87,37 @@ struct Index {
   // 用户要求「挂断要随时能按，不用等朗读念完」，所以按钮不再按状态禁用，靠这个序号收尾。
   private callTurnId: number = 0;
 
+  /**
+   * 通话入口只在「会话页」出现。
+   *
+   * 之前只在浮层盖住右上角时才藏，结果切到设置/插件/其它菜单页照样挡着人家按钮
+   * （用户明确要求：菜单页不要出现聊天气泡）。这里按页面结构判定：
+   *   · 首页（有「选择工作区」「标准模式」按钮）⇒ 不显示；
+   *   · 有消息流（flowItem）或会话里的「发送消息」按钮 ⇒ 显示；
+   *   · 其余页面（设置、插件、关于等）⇒ 不显示。
+   */
+  @State callEntryShown: boolean = false;
+  private chromeTimer: number = -1;
+  private chromeProbeId: number = 0;
+
+  /**
+   * 语音设置：识别方式（自动/云端/DeepSeek 账号/系统离线）、停顿档位、朗读来源。
+   *
+   * 数据与 Node 侧 `<files>/runtime/voice-settings.json` 同源 —— 面板保存后，
+   * 云端识别路由与云端朗读路由读到的就是同一份，不需要额外同步协议。
+   */
+  @State settingsVisible: boolean = false;
+  @State settingsNote: string = '';
+  @State vtRecognizer: string = 'auto';
+  @State vtPause: string = 'normal';
+  @State vtVoice: string = 'system';
+  @State vtKey: string = '';
+  @State vtAsrBase: string = '';
+  @State vtAsrModel: string = '';
+  @State vtTtsBase: string = '';
+  @State vtTtsModel: string = '';
+  @State vtTtsVoice: string = '';
+
   aboutToAppear(): void {
     // 调试通道：debug 构建开。ArkWeb 远程调试（CDP），release 关闭。
     if (BuildProfile.DEBUG) {
@@ -93,6 +149,13 @@ struct Index {
         this.showOverlay = true;
       }
     });
+  }
+
+  aboutToDisappear(): void {
+    if (this.chromeTimer !== -1) {
+      clearInterval(this.chromeTimer);
+      this.chromeTimer = -1;
+    }
   }
 
   private loadPending(): void {
@@ -219,6 +282,68 @@ struct Index {
         }
       }
       return text;
+    });
+  }
+
+  private buildChromeProbeScript(): string {
+    return `(() => {
+  try {
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    let send = false;
+    const buttons = document.querySelectorAll('[role="button"],button,[aria-label]');
+    for (let i = 0; i < buttons.length; i += 1) {
+      const el = buttons[i];
+      const aria = el.getAttribute ? (el.getAttribute('aria-label') || '') : '';
+      if (aria.indexOf('选择工作区') >= 0) { return '0'; }
+      if (aria.indexOf('发送消息') >= 0) { send = true; }
+    }
+    if (!send && document.querySelector('[class*="flowItem"]') === null) { return '0'; }
+    let node = document.elementFromPoint(vw - 44, 96);
+    while (node !== null && node !== document.body) {
+      const marker = String(node.className || '') + ' ' +
+        String(node.getAttribute('role') || '') + ' ' +
+        String(node.getAttribute('aria-modal') || '');
+      const rect = node.getBoundingClientRect();
+      const veil = /mask|backdrop|scrim/i.test(marker);
+      const layer = /overlay|dialog|sheet|modal|drawer/i.test(marker);
+      const fullPage = rect.width >= vw * 0.85 && rect.height >= vh * 0.85;
+      const sheet = rect.width >= vw * 0.8 && /dialog|modal|sheet/i.test(marker);
+      if (!veil && layer && (fullPage || sheet)) { return '0'; }
+      node = node.parentElement;
+    }
+    return '1';
+  } catch (error) {
+    return '0';
+  }
+})()`;
+  }
+
+  /** 每 1.2 秒看一次当前是不是会话页；只影响入口显示，不影响通话本身。 */
+  private startChromeWatch(): void {
+    if (this.chromeTimer !== -1) {
+      return;
+    }
+    this.chromeTimer = setInterval((): void => {
+      this.probeChrome();
+    }, 1200);
+  }
+
+  private probeChrome(): void {
+    if (this.showOverlay || this.callVisible) {
+      return;
+    }
+    const probeId: number = ++this.chromeProbeId;
+    this.evalInPage(this.buildChromeProbeScript()).then((raw: string) => {
+      if (probeId !== this.chromeProbeId) {
+        return;
+      }
+      const shown: boolean = raw.trim() === '1';
+      if (shown !== this.callEntryShown) {
+        this.callEntryShown = shown;
+      }
+    }).catch(() => {
+      // 页面还没就绪：下一轮再试。
     });
   }
 
@@ -444,11 +569,13 @@ struct Index {
     this.callTranscript = '';
     this.callReply = '';
     this.callState = 'listening';
-    this.callStatus = '正在听你说…（说完停 1 秒就自动结束，最长 30 秒）';
+    this.callStatus = '正在听你说…（说完停一下自动结束，最长 30 秒）';
+    // 语音设置：停顿档位决定「静音多久算说完」，识别/朗读来源也在里面。
+    const settings: VoiceSettings = readVoiceSettings(context);
     // 先开录、再准备会话：会话探测/打开可能要几百毫秒到几秒，放在录音之前会把用户开口的
     // 头几个字整段丢掉（真机反馈「识别前边的拾音会缺失好几秒」）。录音在宿主侧跑，页面这边
     // 同时去开会话，两边并行。
-    const recording = HostCapabilities.recordForCall(context, 30000);
+    const recording = HostCapabilities.recordForCall(context, 30000, pauseSilenceMs(settings.pause));
     // 首页没有会话视图时，自动打开最近的会话：让用户「先去点会话、再回来点说话」太别扭（真机踩过）。
     let sessionReady: boolean = false;
     try {
@@ -501,19 +628,26 @@ struct Index {
       `${stopNote}${((recorded.durationMs ?? 0) / 1000).toFixed(1)}s · ${recorded.bytes ?? 0}B · 采样 ${recorded.sampleRate ?? 0}Hz · 峰值 ${recorded.peak ?? 0} · 来源 ${recorded.input ?? ''}`;
     // 云端优先：离线引擎的中文准确率有上限（同一段录音稳定错在同样的词），云。DeepSeek ASR
     // 由账号代付、约 1 秒出结果；拿不到文本再回退离线识别，保证离线也能用。
-    this.callStatus = `正在识别（云端）…（${audioDetail}）`;
+    // 语音设置里选「系统离线」时直接跳过云端，省掉一次必然失败的往返。
     let text: string = '';
-    let engineNote: string = '云端';
-    try {
-      const raw: string = await this.evalInPage(this.buildCloudRecognizeScript(recorded.path));
-      const cloud: CloudRecognizeReply = raw === '' ? {} : (JSON.parse(raw) as CloudRecognizeReply);
-      if (cloud.ok === true && (cloud.text ?? '').trim() !== '') {
-        text = (cloud.text ?? '').trim();
-      } else {
-        engineNote = `离线（云端不可用：${cloud.error?.message ?? '未返回文本'}）`;
+    let engineNote: string = '';
+    if (settings.recognizer === 'system') {
+      engineNote = '离线（设置：系统离线）';
+    } else {
+      this.callStatus = `正在识别（云端）…（${audioDetail}）`;
+      engineNote = '云端';
+      try {
+        const raw: string = await this.evalInPage(this.buildCloudRecognizeScript(recorded.path));
+        const cloud: CloudRecognizeReply = raw === '' ? {} : (JSON.parse(raw) as CloudRecognizeReply);
+        if (cloud.ok === true && (cloud.text ?? '').trim() !== '') {
+          text = (cloud.text ?? '').trim();
+          engineNote = `云端（${cloud.provider ?? 'deepseek'}）`;
+        } else {
+          engineNote = `离线（云端不可用：${cloud.error?.message ?? '未返回文本'}）`;
+        }
+      } catch (error) {
+        engineNote = '离线（云端调用失败）';
       }
-    } catch (error) {
-      engineNote = '离线（云端调用失败）';
     }
     if (text === '') {
       this.callStatus = `正在识别（离线）…（${audioDetail}）`;
@@ -573,17 +707,167 @@ struct Index {
     }
     this.callReply = reply;
     this.callState = 'speaking';
-    this.callStatus = '正在朗读回复…';
-    const spoken = await HostCapabilities.speakForCall(context, reply.length > 1200 ? reply.slice(0, 1200) : reply);
-    // 引擎。onComplete 会提前报（实。143 字在 +1.4s 就说完成，真实朗读约 30s），
-    // 所以按字数估算的时长把「朗读中」保持住，别让用户以为读完了去点「说话」把它掐断。
-    const waitMs: number = spoken.estimateMs !== undefined ? spoken.estimateMs : 3000;
-    await this.sleep(waitMs);
+    const speakText: string = reply.length > 1200 ? reply.slice(0, 1200) : reply;
+    // 朗读来源由语音设置决定：系统 TTS（离线、立刻出声）或云端合成（阿里云百炼，音色好听但要等）。
+    await this.playReply(context, speakText, turnId, settings.voice === 'cloud');
     if (!this.liveTurn(turnId)) {
       return;
     }
     this.callState = 'idle';
     this.callStatus = '说完了，点「说话」继续';
+  }
+
+  /**
+   * 朗读一段回复：云端合成优先（若设置里选了），失败或没选就回退系统 TTS。
+   *
+   * 云端朗读的播放发生在页面里（页面里的 `Audio` 才能直接吃同源音频流），所以这里
+   * 做三件事：让页面发起合成 → 轮询合成结果 → 播完后轮询播放状态，直到播完或被打断。
+   */
+  private async playReply(context: common.UIAbilityContext, text: string, turnId: number, useCloud: boolean): Promise<void> {
+    if (useCloud) {
+      this.callStatus = '正在合成云端语音…';
+      try {
+        await this.evalInPage(this.buildCloudTtsScript(text));
+        let url: string = '';
+        let cloudError: string = '';
+        for (let i = 0; i < 100; i++) {
+          await this.sleep(300);
+          if (!this.liveTurn(turnId)) {
+            return;
+          }
+          const raw: string = await this.evalInPage(this.buildCloudTtsStateScript());
+          const state: CloudTtsState = raw === '' ? {} : (JSON.parse(raw) as CloudTtsState);
+          if (state.state === 'ready') {
+            url = state.url ?? '';
+            break;
+          }
+          if (state.state === 'error') {
+            cloudError = state.error ?? '未知原因';
+            break;
+          }
+        }
+        if (url !== '') {
+          const started: string = await this.evalInPage(this.buildPlayAudioScript(url));
+          if (started === 'playing') {
+            this.callStatus = '正在朗读回复…';
+            for (let i = 0; i < 1200; i++) {
+              await this.sleep(250);
+              if (!this.liveTurn(turnId)) {
+                await this.evalInPage(this.buildStopAudioScript());
+                return;
+              }
+              const raw: string = await this.evalInPage(this.buildSpeakStateScript());
+              const state: SpeakPlaybackState = raw === '' ? {} : (JSON.parse(raw) as SpeakPlaybackState);
+              if (state.done === true) {
+                return;
+              }
+              if ((state.error ?? '') !== '') {
+                this.callStatus = `云端播放失败：${state.error ?? ''}，改用手机朗读`;
+                break;
+              }
+            }
+            return;
+          }
+        }
+        if (cloudError !== '') {
+          this.callStatus = `云端合成失败：${cloudError}，改用手机朗读`;
+        } else {
+          this.callStatus = '云端合成超时，改用手机朗读';
+        }
+      } catch (error) {
+        const failed: BusinessError = error as BusinessError;
+        this.callStatus = `云端朗读出错：${failed.message}，改用手机朗读`;
+      }
+      if (!this.liveTurn(turnId)) {
+        return;
+      }
+    }
+    this.callStatus = '正在朗读回复…';
+    const spoken = await HostCapabilities.speakForCall(context, text);
+    // 引擎的 onComplete 会提前报（实测 143 字在 +1.4s 就说完成，真实朗读约 30s），
+    // 所以按字数估算的时长把「朗读中」保持住，别让用户以为读完了去点「说话」把它掐断。
+    const waitMs: number = spoken.estimateMs !== undefined ? spoken.estimateMs : 3000;
+    await this.sleep(waitMs);
+  }
+
+  /** 云端合成任务（页面里跑异步 fetch，结果落到 `window.__dshTts`）。*/
+  private buildCloudTtsScript(text: string): string {
+    const payload: string = JSON.stringify(text);
+    return `(() => {
+      window.__dshTts = { state: 'pending', url: '', error: '' };
+      const text = ${payload};
+      (async () => {
+        try {
+          const response = await fetch('/_ohos/speech/cloud-tts', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ text: text })
+          });
+          const data = await response.json();
+          if (data && data.ok === true && typeof data.url === 'string') {
+            window.__dshTts = { state: 'ready', url: data.url, error: '' };
+          } else {
+            const message = data && data.error && data.error.message ? data.error.message : ('HTTP ' + response.status);
+            window.__dshTts = { state: 'error', url: '', error: message };
+          }
+        } catch (error) {
+          window.__dshTts = { state: 'error', url: '', error: String(error) };
+        }
+      })();
+      return 'started';
+    })()`;
+  }
+
+  /** 云端合成进度。*/
+  private buildCloudTtsStateScript(): string {
+    return `JSON.stringify(window.__dshTts || {})`;
+  }
+
+  /** 用页面里的 Audio 播放同源音频（云端合成结果）。*/
+  private buildPlayAudioScript(url: string): string {
+    const target: string = JSON.stringify(url);
+    return `(() => {
+      try {
+        if (window.__dshSpeakAudio) {
+          try { window.__dshSpeakAudio.pause(); } catch (error) {}
+        }
+        window.__dshSpeakDone = false;
+        window.__dshSpeakError = '';
+        const audio = new Audio(${target});
+        window.__dshSpeakAudio = audio;
+        audio.onended = () => { window.__dshSpeakDone = true; };
+        audio.onerror = () => { window.__dshSpeakDone = true; window.__dshSpeakError = 'audio-error'; };
+        const played = audio.play();
+        if (played && typeof played.catch === 'function') {
+          played.catch((error) => { window.__dshSpeakDone = true; window.__dshSpeakError = String(error); });
+        }
+        return 'playing';
+      } catch (error) {
+        return 'error:' + String(error);
+      }
+    })()`;
+  }
+
+  /** 页面音频的播放状态。*/
+  private buildSpeakStateScript(): string {
+    return `JSON.stringify({ done: window.__dshSpeakDone === true, error: window.__dshSpeakError || '' })`;
+  }
+
+  /** 停掉页面音频（挂断 / 打断 / 停止朗读）。*/
+  private buildStopAudioScript(): string {
+    return `(() => {
+      try {
+        if (window.__dshSpeakAudio) {
+          try { window.__dshSpeakAudio.pause(); } catch (error) {}
+          try { window.__dshSpeakAudio.src = ''; } catch (error) {}
+          window.__dshSpeakAudio = null;
+        }
+        window.__dshSpeakDone = true;
+        return 'stopped';
+      } catch (error) {
+        return 'error:' + String(error);
+      }
+    })()`;
   }
 
   /** 通话面板顶部的一句话状态（给用户看的当前阶段）。*/
@@ -675,6 +959,7 @@ struct Index {
           this.loadPending();
         })
         .onPageEnd((): void => {
+          this.startChromeWatch();
           // 只清一次：清掉启动页（boot.html），不打。dsh 前端自身的回退栈。
           if (this.historyCleared) {
             return;
@@ -733,7 +1018,7 @@ struct Index {
       }
 
       // 通话入口：悬浮右上角。透明容器只让按钮接收点击，页面其余部分照常响应。
-      if (!this.showOverlay && !this.callVisible) {
+      if (!this.showOverlay && !this.callVisible && this.callEntryShown) {
         Column() {
           // 透明玻璃球：整个球面（本体渐变 + 左上局部反光斑 + 高光核 + 右下内壁反射 + 描边 + 线条话筒）
           // 都画在 ic_phone_glass.svg 里，避免 ArkUI 各属性叠加时出现灰杠/不透材质。
@@ -763,9 +1048,20 @@ struct Index {
       if (this.callVisible) {
         Column() {
           Column({ space: 14 }) {
-            Text('语音通话')
-              .fontSize(20)
-              .fontWeight(FontWeight.Medium)
+            Row() {
+              Text('语音通话')
+                .fontSize(20)
+                .fontWeight(FontWeight.Medium)
+              Blank()
+              Text('设置')
+                .fontSize(13)
+                .fontColor('#0F766E')
+                .padding({ left: 8, right: 2, top: 4, bottom: 4 })
+                .onClick((): void => {
+                  this.openSettings();
+                })
+            }
+            .width('100%')
             Text(`${this.stateLabel()} · ${this.callStatus}`)
               .fontSize(13)
               .fontColor('#0F766E')
@@ -872,8 +1168,346 @@ struct Index {
         .alignItems(HorizontalAlign.Center)
         .backgroundColor('#B3000000')
       }
+
+      // 语音设置：识别方式（自动/云端/DeepSeek 账号/系统离线）、停顿档位、朗读来源、云端服务参数。
+      // 与 Node 侧 `<files>/runtime/voice-settings.json` 同源，保存后云端识别/朗读路由立刻按新值走。
+      if (this.settingsVisible) {
+        Column() {
+          Column() {
+            Scroll() {
+            Column({ space: 12 }) {
+              Row() {
+                Text('语音设置')
+                  .fontSize(20)
+                  .fontWeight(FontWeight.Medium)
+                Blank()
+                Text('收起')
+                  .fontSize(13)
+                  .fontColor('#0F766E')
+                  .onClick((): void => {
+                    this.settingsVisible = false;
+                  })
+              }
+              .width('100%')
+
+              Text('识别方式')
+                .fontSize(12)
+                .fontColor('#6B7280')
+                .width('100%')
+              Flex({ wrap: FlexWrap.Wrap }) {
+                this.chipRecognizer('自动（云端优先）', 'auto')
+                this.chipRecognizer('其他云端服务', 'cloud')
+                this.chipRecognizer('DeepSeek 账号', 'deepseek')
+                this.chipRecognizer('系统离线', 'system')
+              }
+              .width('100%')
+
+              Text('停顿多久算说完')
+                .fontSize(12)
+                .fontColor('#6B7280')
+                .width('100%')
+              Flex({ wrap: FlexWrap.Wrap }) {
+                this.chipPause('快 0.5 秒', 'quick')
+                this.chipPause('普通 0.9 秒', 'normal')
+                this.chipPause('耐心 1.8 秒', 'patient')
+              }
+              .width('100%')
+
+              Text('朗读')
+                .fontSize(12)
+                .fontColor('#6B7280')
+                .width('100%')
+              Flex({ wrap: FlexWrap.Wrap }) {
+                this.chipVoice('手机系统', 'system')
+                this.chipVoice('云端合成', 'cloud')
+              }
+              .width('100%')
+
+              Text('云端服务（阿里云百炼，或其他 OpenAI 兼容服务）')
+                .fontSize(12)
+                .fontColor('#6B7280')
+                .width('100%')
+
+              Column({ space: 4 }) {
+                Text('API Key')
+                  .fontSize(11)
+                  .fontColor('#9CA3AF')
+                  .width('100%')
+                TextInput({ text: this.vtKey, placeholder: 'sk-…（百炼控制台创建）' })
+                  .type(InputType.Password)
+                  .fontSize(13)
+                  .height(40)
+                  .onChange((value: string): void => {
+                    this.vtKey = value;
+                  })
+              }
+              .width('100%')
+
+              Column({ space: 4 }) {
+                Text('识别 Base（OpenAI 兼容）')
+                  .fontSize(11)
+                  .fontColor('#9CA3AF')
+                  .width('100%')
+                TextInput({ text: this.vtAsrBase })
+                  .fontSize(12)
+                  .height(40)
+                  .onChange((value: string): void => {
+                    this.vtAsrBase = value;
+                  })
+              }
+              .width('100%')
+
+              Column({ space: 4 }) {
+                Text('识别模型')
+                  .fontSize(11)
+                  .fontColor('#9CA3AF')
+                  .width('100%')
+                Flex({ wrap: FlexWrap.Wrap }) {
+                  this.chipAsrPreset('Qwen3-ASR-Flash', 'qwen3-asr-flash')
+                  this.chipAsrPreset('whisper-1', 'whisper-1')
+                }
+                .width('100%')
+                TextInput({ text: this.vtAsrModel, placeholder: 'qwen3-asr-flash' })
+                  .fontSize(12)
+                  .height(40)
+                  .onChange((value: string): void => {
+                    this.vtAsrModel = value;
+                  })
+              }
+              .width('100%')
+
+              Column({ space: 4 }) {
+                Text('朗读 Base（百炼 / 业务空间域名）')
+                  .fontSize(11)
+                  .fontColor('#9CA3AF')
+                  .width('100%')
+                TextInput({ text: this.vtTtsBase })
+                  .fontSize(12)
+                  .height(40)
+                  .onChange((value: string): void => {
+                    this.vtTtsBase = value;
+                  })
+              }
+              .width('100%')
+
+              Column({ space: 4 }) {
+                Text('朗读模型（一键切换）')
+                  .fontSize(11)
+                  .fontColor('#9CA3AF')
+                  .width('100%')
+                Flex({ wrap: FlexWrap.Wrap }) {
+                  this.chipTtsPreset('Qwen3-TTS-Flash · Cherry', 'qwen3-tts-flash', 'Cherry')
+                  this.chipTtsPreset('CosyVoice-v3.5-Flash · longanyang', 'cosyvoice-v3.5-flash', 'longanyang')
+                }
+                .width('100%')
+                TextInput({ text: this.vtTtsModel, placeholder: 'qwen3-tts-flash / cosyvoice-v3.5-flash' })
+                  .fontSize(12)
+                  .height(40)
+                  .onChange((value: string): void => {
+                    this.vtTtsModel = value;
+                  })
+              }
+              .width('100%')
+
+              Column({ space: 4 }) {
+                Text('音色')
+                  .fontSize(11)
+                  .fontColor('#9CA3AF')
+                  .width('100%')
+                Flex({ wrap: FlexWrap.Wrap }) {
+                  this.chipVoicePreset('Cherry', 'Cherry')
+                  this.chipVoicePreset('Ethan', 'Ethan')
+                  this.chipVoicePreset('longanyang', 'longanyang')
+                }
+                .width('100%')
+                TextInput({ text: this.vtTtsVoice, placeholder: 'Cherry / longanyang' })
+                  .fontSize(12)
+                  .height(40)
+                  .onChange((value: string): void => {
+                    this.vtTtsVoice = value;
+                  })
+              }
+              .width('100%')
+
+              Row({ space: 10 }) {
+                Button('保存')
+                  .layoutWeight(1)
+                  .height(46)
+                  .backgroundColor('#0F766E')
+                  .fontColor('#FFFFFF')
+                  .onClick((): void => {
+                    this.saveSettings();
+                  })
+                Button('关闭')
+                  .layoutWeight(1)
+                  .height(46)
+                  .backgroundColor('#E5E7EB')
+                  .fontColor('#111827')
+                  .onClick((): void => {
+                    this.settingsVisible = false;
+                  })
+              }
+              .width('100%')
+
+              Text(this.settingsNote)
+                .fontSize(11)
+                .fontColor('#6B7280')
+                .width('100%')
+            }
+            .width('100%')
+            .padding({ left: 4, right: 4, bottom: 8 })
+          }
+          .width('100%')
+          .layoutWeight(1)
+          .scrollBar(BarState.Off)
+        }
+        .width('92%')
+        .height('86%')
+        .padding(20)
+        .borderRadius(18)
+        .backgroundColor('#FFFFFF')
+        .shadow({ radius: 24, color: '#33000000', offsetY: 6 })
+        }
+        .width('100%')
+        .height('100%')
+        .justifyContent(FlexAlign.Center)
+        .alignItems(HorizontalAlign.Center)
+        .backgroundColor('#B3000000')
+      }
     }
     .width('100%')
     .height('100%')
+  }
+
+  /** 识别方式芯片。*/
+  @Builder
+  chipRecognizer(label: string, value: string) {
+    Text(label)
+      .fontSize(12)
+      .fontColor(this.vtRecognizer === value ? '#0B3B34' : '#374151')
+      .padding({ left: 10, right: 10, top: 6, bottom: 6 })
+      .margin({ right: 6, bottom: 6 })
+      .borderRadius(14)
+      .backgroundColor(this.vtRecognizer === value ? '#7FD3C4' : '#F1F5F4')
+      .onClick((): void => {
+        this.vtRecognizer = value;
+      })
+  }
+
+  /** 停顿档位芯片。*/
+  @Builder
+  chipPause(label: string, value: string) {
+    Text(label)
+      .fontSize(12)
+      .fontColor(this.vtPause === value ? '#0B3B34' : '#374151')
+      .padding({ left: 10, right: 10, top: 6, bottom: 6 })
+      .margin({ right: 6, bottom: 6 })
+      .borderRadius(14)
+      .backgroundColor(this.vtPause === value ? '#7FD3C4' : '#F1F5F4')
+      .onClick((): void => {
+        this.vtPause = value;
+      })
+  }
+
+  /** 朗读来源芯片。*/
+  @Builder
+  chipVoice(label: string, value: string) {
+    Text(label)
+      .fontSize(12)
+      .fontColor(this.vtVoice === value ? '#0B3B34' : '#374151')
+      .padding({ left: 10, right: 10, top: 6, bottom: 6 })
+      .margin({ right: 6, bottom: 6 })
+      .borderRadius(14)
+      .backgroundColor(this.vtVoice === value ? '#7FD3C4' : '#F1F5F4')
+      .onClick((): void => {
+        this.vtVoice = value;
+      })
+  }
+
+  /** 识别模型预设芯片。*/
+  @Builder
+  chipAsrPreset(label: string, model: string) {
+    Text(label)
+      .fontSize(12)
+      .fontColor(this.vtAsrModel === model ? '#0B3B34' : '#374151')
+      .padding({ left: 10, right: 10, top: 6, bottom: 6 })
+      .margin({ right: 6, bottom: 6 })
+      .borderRadius(14)
+      .backgroundColor(this.vtAsrModel === model ? '#7FD3C4' : '#F1F5F4')
+      .onClick((): void => {
+        this.vtAsrModel = model;
+      })
+  }
+
+  /** 朗读模型预设芯片（同时设定音色）。*/
+  @Builder
+  chipTtsPreset(label: string, model: string, voice: string) {
+    Text(label)
+      .fontSize(12)
+      .fontColor(this.vtTtsModel === model ? '#0B3B34' : '#374151')
+      .padding({ left: 10, right: 10, top: 6, bottom: 6 })
+      .margin({ right: 6, bottom: 6 })
+      .borderRadius(14)
+      .backgroundColor(this.vtTtsModel === model ? '#7FD3C4' : '#F1F5F4')
+      .onClick((): void => {
+        this.vtTtsModel = model;
+        this.vtTtsVoice = voice;
+      })
+  }
+
+  /** 音色预设芯片。*/
+  @Builder
+  chipVoicePreset(label: string, voice: string) {
+    Text(label)
+      .fontSize(12)
+      .fontColor(this.vtTtsVoice === voice ? '#0B3B34' : '#374151')
+      .padding({ left: 10, right: 10, top: 6, bottom: 6 })
+      .margin({ right: 6, bottom: 6 })
+      .borderRadius(14)
+      .backgroundColor(this.vtTtsVoice === voice ? '#7FD3C4' : '#F1F5F4')
+      .onClick((): void => {
+        this.vtTtsVoice = voice;
+      })
+  }
+
+  /** 打开设置面板：把磁盘上的设置读进 @State。*/
+  private openSettings(): void {
+    const context: common.UIAbilityContext = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    const settings: VoiceSettings = readVoiceSettings(context);
+    this.vtRecognizer = settings.recognizer;
+    this.vtPause = settings.pause;
+    this.vtVoice = settings.voice;
+    this.vtKey = settings.cloud.key;
+    this.vtAsrBase = settings.cloud.asrBase;
+    this.vtAsrModel = settings.cloud.asrModel;
+    this.vtTtsBase = settings.cloud.ttsBase;
+    this.vtTtsModel = settings.cloud.ttsModel;
+    this.vtTtsVoice = settings.cloud.ttsVoice;
+    this.settingsNote = '';
+    this.settingsVisible = true;
+  }
+
+  /** 保存设置到 `<files>/runtime/voice-settings.json`（Node 侧路由读同一份）。*/
+  private saveSettings(): void {
+    const context: common.UIAbilityContext = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    const fallback: VoiceSettings = defaultVoiceSettings();
+    const cloud: CloudVoiceSettings = {
+      key: this.vtKey.trim(),
+      asrBase: this.vtAsrBase.trim() === '' ? fallback.cloud.asrBase : this.vtAsrBase.trim(),
+      asrModel: this.vtAsrModel.trim() === '' ? fallback.cloud.asrModel : this.vtAsrModel.trim(),
+      ttsBase: this.vtTtsBase.trim() === '' ? fallback.cloud.ttsBase : this.vtTtsBase.trim(),
+      ttsModel: this.vtTtsModel.trim() === '' ? fallback.cloud.ttsModel : this.vtTtsModel.trim(),
+      ttsVoice: this.vtTtsVoice.trim() === '' ? fallback.cloud.ttsVoice : this.vtTtsVoice.trim()
+    };
+    const settings: VoiceSettings = {
+      recognizer: this.vtRecognizer,
+      voice: this.vtVoice,
+      pause: this.vtPause,
+      cloud: cloud
+    };
+    const ok: boolean = writeVoiceSettings(context, settings);
+    this.settingsNote = ok
+      ? `已保存：识别=${recognizerLabel(this.vtRecognizer)}，停顿=${pauseLabel(this.vtPause)}，朗读=${voiceLabel(this.vtVoice)}`
+      : '保存失败：写不进运行目录，检查存储权限';
   }
 }

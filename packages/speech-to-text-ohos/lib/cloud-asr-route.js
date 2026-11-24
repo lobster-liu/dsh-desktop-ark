@@ -16,6 +16,7 @@
  */
 
 import { readFileSync } from 'node:fs'
+import { readSettings, resolveRecognizer } from './voice-settings.js'
 
 /** 路由路径。 */
 export const CLOUD_ASR_PATH = '/_ohos/speech/cloud-asr'
@@ -168,6 +169,138 @@ export async function transcribeCloud(wav, options) {
 }
 
 /**
+ * 从 chat 响应的 `choices[0].message.content` 里取文本（可能是字符串或分段数组）。
+ * @param {unknown} parsed
+ * @returns {string}
+ */
+function chatTextOf(parsed) {
+  const content = /** @type {any} */ (parsed)?.choices?.[0]?.message?.content
+  if (typeof content === 'string') return content.trim()
+  if (Array.isArray(content)) {
+    const pieces = []
+    for (const part of content) {
+      if (typeof part?.text === 'string') pieces.push(part.text)
+      else if (typeof part === 'string') pieces.push(part)
+    }
+    return pieces.join('').trim()
+  }
+  // 阿里云原生形态：output.text / output.choices[0].message.content
+  const native = /** @type {any} */ (parsed)?.output
+  if (typeof native?.text === 'string') return native.text.trim()
+  const nested = native?.choices?.[0]?.message?.content
+  if (typeof nested === 'string') return nested.trim()
+  return ''
+}
+
+/**
+ * 自定义云端识别（「其他云端服务」），两种协议：
+ *  · 百炼 Qwen3-ASR：OpenAI 兼容 `POST {base}/chat/completions`，音频以 Base64 data URI 放进消息；
+ *  · 其他 OpenAI 兼容服务：`POST {base}/audio/transcriptions`（multipart `file` + `model`）。
+ *
+ * @param {Buffer} wav
+ * @param {{ key: string, asrBase: string, asrModel: string }} cloud
+ * @returns {Promise<{ text: string, credential: string, status: number, detail?: string, protocol?: string }>}
+ */
+export async function transcribeCustom(wav, cloud) {
+  const base = cloud.asrBase.replace(/\/+$/, '')
+  const model = cloud.asrModel
+  const auth = { authorization: `Bearer ${cloud.key}` }
+  const qwen = /^qwen/i.test(model)
+  if (qwen) {
+    const url = `${base}/chat/completions`
+    const body = {
+      model,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'input_audio', input_audio: { data: `data:audio/wav;base64,${wav.toString('base64')}` } }
+          ]
+        }
+      ],
+      stream: false,
+      asr_options: { language: 'zh' }
+    }
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { ...auth, 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify(body)
+    })
+    const raw = Buffer.from(await response.arrayBuffer()).toString('utf8')
+    if (!response.ok) {
+      return { text: '', credential: 'api-key', status: response.status, detail: raw.slice(0, 400), protocol: 'qwen-chat' }
+    }
+    let parsed
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      return { text: '', credential: 'api-key', status: 502, detail: 'not-json', protocol: 'qwen-chat' }
+    }
+    return { text: chatTextOf(parsed), credential: 'api-key', status: response.status, protocol: 'qwen-chat' }
+  }
+  const url = `${base}/audio/transcriptions`
+  const boundary = `----dsh${Date.now().toString(16)}`
+  const head = Buffer.from(
+    `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="speech.wav"\r\n`
+    + 'Content-Type: audio/wav\r\n\r\n',
+    'utf8'
+  )
+  const modelField = Buffer.from(
+    `\r\n--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\n${model}`,
+    'utf8'
+  )
+  const tail = Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8')
+  const body = Buffer.concat([head, wav, modelField, tail])
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      ...auth,
+      'content-type': `multipart/form-data; boundary=${boundary}`,
+      'content-length': String(body.length),
+      accept: 'application/json'
+    },
+    body
+  })
+  const raw = Buffer.from(await response.arrayBuffer()).toString('utf8')
+  if (!response.ok) {
+    return { text: '', credential: 'api-key', status: response.status, detail: raw.slice(0, 400), protocol: 'transcriptions' }
+  }
+  let parsed
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return { text: '', credential: 'api-key', status: 502, detail: 'not-json', protocol: 'transcriptions' }
+  }
+  let text = typeof parsed?.text === 'string' ? parsed.text.trim() : ''
+  if (text === '') text = chatTextOf(parsed)
+  return { text, credential: 'api-key', status: response.status, protocol: 'transcriptions' }
+}
+
+/**
+ * 按设置里选中的「识别方式」决定走哪条路。
+ *
+ * `system` 时调用方应直接用系统离线引擎（这里不发请求）；`cloud` 走用户配的云端服务；
+ * `deepseek` 走账号凭证（原行为）。
+ *
+ * @param {Buffer} wav
+ * @param {{ ctx: unknown }} options
+ * @returns {Promise<{ provider: 'system'|'cloud'|'deepseek', text: string, credential: string, status: number, detail?: string, protocol?: string }>}
+ */
+export async function transcribeWithSettings(wav, options) {
+  const settings = readSettings()
+  const provider = resolveRecognizer(settings)
+  if (provider === 'system') {
+    return { provider, text: '', credential: 'none', status: 0 }
+  }
+  if (provider === 'cloud') {
+    const result = await transcribeCustom(wav, settings.cloud)
+    return { provider, ...result }
+  }
+  const result = await transcribeCloud(wav, options)
+  return { provider, ...result }
+}
+
+/**
  * 注册路由（需要 `webServer` / `connection`；`account` 取不到就降级）。
  * @param {import('@deepseek-ai/cordis').Context} ctx
  */
@@ -213,10 +346,19 @@ export function registerCloudAsrRoute(ctx) {
           }
           const startedAt = Date.now()
           try {
-            const result = await transcribeCloud(wavOf(pcm), { ctx })
+            const result = await transcribeWithSettings(wavOf(pcm), { ctx })
+            if (result.provider === 'system') {
+              sendJson(res, 409, {
+                ok: false,
+                provider: result.provider,
+                error: { code: 'speech/provider-system', message: '识别方式设置为「系统离线」，请直接在设备上识别' }
+              })
+              return
+            }
             if (result.credential === 'none') {
               sendJson(res, 401, {
                 ok: false,
+                provider: result.provider,
                 error: { code: 'speech/no-credential', message: '没有可用于云端识别的账号或 API key' }
               })
               return
@@ -224,7 +366,17 @@ export function registerCloudAsrRoute(ctx) {
             if (result.status !== 200) {
               sendJson(res, 502, {
                 ok: false,
+                provider: result.provider,
                 error: { code: 'speech/upstream', message: `云端识别失败 HTTP ${result.status}` },
+                detail: result.detail ?? ''
+              })
+              return
+            }
+            if (result.text === '') {
+              sendJson(res, 502, {
+                ok: false,
+                provider: result.provider,
+                error: { code: 'speech/empty-text', message: '云端没有返回文本' },
                 detail: result.detail ?? ''
               })
               return
@@ -233,6 +385,8 @@ export function registerCloudAsrRoute(ctx) {
               ok: true,
               text: result.text,
               engine: 'cloud',
+              provider: result.provider,
+              protocol: result.protocol ?? 'account',
               credential: result.credential,
               ms: Date.now() - startedAt,
               bytes: pcm.length

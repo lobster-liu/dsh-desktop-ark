@@ -29,6 +29,8 @@ import { registerSpeakRoute } from './speak-route.js'
 import { registerRecordRoute } from './record-route.js'
 import { registerRecognizeRoute } from './recognize-route.js'
 import { registerCloudAsrRoute } from './cloud-asr-route.js'
+import { registerCloudTtsRoute } from './cloud-tts-route.js'
+import { registerVoiceSettingsRoute } from './voice-settings.js'
 
 /** Cordis 插件名。 */
 export const name = 'speech-to-text-ohos'
@@ -167,6 +169,8 @@ export function apply(ctx) {
   ctx.inject(['webServer', 'connection'], (scoped) => registerRecordRoute(scoped))
   ctx.inject(['webServer', 'connection'], (scoped) => registerRecognizeRoute(scoped))
   ctx.inject(['webServer', 'connection'], (scoped) => registerCloudAsrRoute(scoped))
+  ctx.inject(['webServer', 'connection'], (scoped) => registerCloudTtsRoute(scoped))
+  ctx.inject(['webServer', 'connection'], (scoped) => registerVoiceSettingsRoute(scoped))
 }
 
 /**
