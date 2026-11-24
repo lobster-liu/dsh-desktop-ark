@@ -44,6 +44,26 @@ function sendJson(res, status, payload) {
 }
 
 /**
+ * 从上游错误体里提炼一句人能读的原因（百炼的 `Model.AccessDenied` 之类）。
+ * @param {string|undefined} detail
+ * @returns {string}
+ */
+function upstreamMessage(detail) {
+  if (!detail) {
+    return ''
+  }
+  try {
+    const parsed = JSON.parse(detail)
+    const error = parsed?.error ?? parsed
+    const code = String(error?.code ?? '')
+    const message = String(error?.message ?? '')
+    return [code, message].filter((part) => part !== '').join(' · ').slice(0, 240)
+  } catch (failure) {
+    return String(detail).slice(0, 160)
+  }
+}
+
+/**
  * 读取请求体里的 JSON。
  * @param {import('node:http').IncomingMessage} req
  * @returns {Promise<Record<string, unknown>>}
@@ -364,10 +384,14 @@ export function registerCloudAsrRoute(ctx) {
               return
             }
             if (result.status !== 200) {
+              const reason = upstreamMessage(result.detail)
               sendJson(res, 502, {
                 ok: false,
                 provider: result.provider,
-                error: { code: 'speech/upstream', message: `云端识别失败 HTTP ${result.status}` },
+                error: {
+                  code: 'speech/upstream',
+                  message: `云端识别失败 HTTP ${result.status}${reason === '' ? '' : '：' + reason}`
+                },
                 detail: result.detail ?? ''
               })
               return

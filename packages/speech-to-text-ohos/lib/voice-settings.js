@@ -69,6 +69,28 @@ function text(value) {
 }
 
 /**
+ * 业务空间专属域名（`https://ws-xxxx.cn-beijing.maas.aliyuncs.com/...`）与公共域名是两套 key：
+ * 用户只填了识别 Base 时，把朗读 Base 一起挪到同一个域名下（仍是 `/api/v1`），省得两边对不上报 403。
+ * @param {string} asrBase
+ * @param {string} ttsBase
+ * @returns {string}
+ */
+export function deriveTtsBase(asrBase, ttsBase) {
+  const fallback = DEFAULT_SETTINGS.cloud.ttsBase
+  try {
+    const asr = new URL(asrBase)
+    const tts = new URL(ttsBase === '' ? fallback : ttsBase)
+    const publicHost = 'dashscope.aliyuncs.com'
+    if (asr.origin !== tts.origin && tts.hostname === publicHost && asr.hostname !== publicHost) {
+      return `${asr.origin}/api/v1`
+    }
+    return ttsBase === '' ? fallback : ttsBase
+  } catch (error) {
+    return ttsBase === '' ? fallback : ttsBase
+  }
+}
+
+/**
  * 校验并补全设置（坏值回默认）。
  * @param {unknown} raw
  * @returns {typeof DEFAULT_SETTINGS}
@@ -81,15 +103,16 @@ export function normalizeSettings(raw) {
   const recognizer = RECOGNIZERS.includes(String(input.recognizer)) ? String(input.recognizer) : DEFAULT_SETTINGS.recognizer
   const voice = VOICES.includes(String(input.voice)) ? String(input.voice) : DEFAULT_SETTINGS.voice
   const pause = PAUSES.includes(String(input.pause)) ? String(input.pause) : DEFAULT_SETTINGS.pause
+  const asrBase = text(cloudIn.asrBase) || DEFAULT_SETTINGS.cloud.asrBase
   return {
     recognizer,
     voice,
     pause,
     cloud: {
       key: text(cloudIn.key),
-      asrBase: text(cloudIn.asrBase) || DEFAULT_SETTINGS.cloud.asrBase,
+      asrBase,
       asrModel: text(cloudIn.asrModel) || DEFAULT_SETTINGS.cloud.asrModel,
-      ttsBase: text(cloudIn.ttsBase) || DEFAULT_SETTINGS.cloud.ttsBase,
+      ttsBase: deriveTtsBase(asrBase, text(cloudIn.ttsBase)),
       ttsModel: text(cloudIn.ttsModel) || DEFAULT_SETTINGS.cloud.ttsModel,
       ttsVoice: text(cloudIn.ttsVoice) || DEFAULT_SETTINGS.cloud.ttsVoice
     }

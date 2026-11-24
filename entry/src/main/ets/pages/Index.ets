@@ -10,6 +10,7 @@ import { HostCapabilities } from '../host/HostCapabilities';
 import {
   CloudVoiceSettings,
   defaultVoiceSettings,
+  deriveTtsBase,
   pauseLabel,
   pauseSilenceMs,
   readVoiceSettings,
@@ -83,6 +84,8 @@ struct Index {
   @State callStatus: string = '点「说话」，说完自动发送';
   @State callTranscript: string = '';
   @State callReply: string = '';
+  /** 云端语音（识别/朗读）失败原因；非空就常驻显示，方便真机上直接看到错误码。 */
+  @State callCloudNote: string = '';
   // 每轮通话一个序号：点「挂断」就自增，让还在等待中的旧轮次在下一个 await 之后自行退出。
   // 用户要求「挂断要随时能按，不用等朗读念完」，所以按钮不再按状态禁用，靠这个序号收尾。
   private callTurnId: number = 0;
@@ -291,14 +294,35 @@ struct Index {
     const vw = window.innerWidth;
     const vh = window.innerHeight;
     let send = false;
+    let current = '';
+    try {
+      const raw = window.localStorage.getItem('dsh.sessions.current');
+      const parsed = raw === null ? null : JSON.parse(raw);
+      current = parsed !== null && typeof parsed.sessionId === 'string' ? parsed.sessionId : '';
+    } catch (error) {
+      current = '';
+    }
+    if (current === '') { return '0'; }
     const buttons = document.querySelectorAll('[role="button"],button,[aria-label]');
     for (let i = 0; i < buttons.length; i += 1) {
       const el = buttons[i];
       const aria = el.getAttribute ? (el.getAttribute('aria-label') || '') : '';
-      if (aria.indexOf('选择工作区') >= 0) { return '0'; }
       if (aria.indexOf('发送消息') >= 0) { send = true; }
     }
-    if (!send && document.querySelector('[class*="flowItem"]') === null) { return '0'; }
+    let docked = false;
+    const editors = document.querySelectorAll('[contenteditable="true"],[data-lexical-editor="true"],textarea');
+    for (let i = 0; i < editors.length; i += 1) {
+      const box = editors[i].getBoundingClientRect();
+      if (box.width > 0 && box.height > 0 && box.top > vh * 0.5) { docked = true; break; }
+    }
+    let tabs = 0;
+    const tabbed = document.querySelectorAll('[role="tab"],button,[role="button"]');
+    for (let i = 0; i < tabbed.length; i += 1) {
+      const text = String(tabbed[i].textContent || '').trim();
+      if (text === '对话' || text === '轨迹') { tabs += 1; }
+    }
+    const session = send || docked || tabs >= 2 || document.querySelector('[class*="flowItem"]') !== null;
+    if (!session) { return '0'; }
     let node = document.elementFromPoint(vw - 44, 96);
     while (node !== null && node !== document.body) {
       const marker = String(node.className || '') + ' ' +
@@ -568,6 +592,7 @@ struct Index {
     }
     this.callTranscript = '';
     this.callReply = '';
+    this.callCloudNote = '';
     this.callState = 'listening';
     this.callStatus = '正在听你说…（说完停一下自动结束，最长 30 秒）';
     // 语音设置：停顿档位决定「静音多久算说完」，识别/朗读来源也在里面。
@@ -642,11 +667,16 @@ struct Index {
         if (cloud.ok === true && (cloud.text ?? '').trim() !== '') {
           text = (cloud.text ?? '').trim();
           engineNote = `云端（${cloud.provider ?? 'deepseek'}）`;
+          this.callCloudNote = '';
         } else {
-          engineNote = `离线（云端不可用：${cloud.error?.message ?? '未返回文本'}）`;
+          const code: string = cloud.error?.code ?? 'unknown';
+          const detail: string = cloud.error?.message ?? '未返回文本';
+          engineNote = `离线（云端不可用：${detail}）`;
+          this.callCloudNote = `云端识别失败：${code} · ${detail}`;
         }
       } catch (error) {
         engineNote = '离线（云端调用失败）';
+        this.callCloudNote = '云端识别失败：页面调用异常（详见 hilog）';
       }
     }
     if (text === '') {
@@ -763,6 +793,7 @@ struct Index {
               }
               if ((state.error ?? '') !== '') {
                 this.callStatus = `云端播放失败：${state.error ?? ''}，改用手机朗读`;
+                this.callCloudNote = `云端朗读失败：${state.error ?? ''}`;
                 break;
               }
             }
@@ -771,12 +802,15 @@ struct Index {
         }
         if (cloudError !== '') {
           this.callStatus = `云端合成失败：${cloudError}，改用手机朗读`;
+          this.callCloudNote = `云端朗读失败：${cloudError}`;
         } else {
           this.callStatus = '云端合成超时，改用手机朗读';
+          this.callCloudNote = '云端朗读失败：合成超时（30 秒无结果）';
         }
       } catch (error) {
         const failed: BusinessError = error as BusinessError;
         this.callStatus = `云端朗读出错：${failed.message}，改用手机朗读`;
+        this.callCloudNote = `云端朗读失败：${failed.message}`;
       }
       if (!this.liveTurn(turnId)) {
         return;
@@ -1084,6 +1118,17 @@ struct Index {
               .backgroundColor('#F2F7F6')
             }
 
+            if (this.callCloudNote !== '') {
+              Text(this.callCloudNote)
+                .fontSize(11)
+                .fontColor('#B91C1C')
+                .width('100%')
+                .textAlign(TextAlign.Start)
+                .padding(8)
+                .borderRadius(8)
+                .backgroundColor('#FEE2E2')
+            }
+
             if (this.callReply !== '') {
               Scroll() {
                 Column({ space: 4 }) {
@@ -1244,7 +1289,7 @@ struct Index {
               .width('100%')
 
               Column({ space: 4 }) {
-                Text('识别 Base（OpenAI 兼容）')
+                Text('识别 Base（OpenAI 兼容；业务空间 key 要填 ws-xxxx.cn-beijing.maas.aliyuncs.com/compatible-mode/v1）')
                   .fontSize(11)
                   .fontColor('#9CA3AF')
                   .width('100%')
@@ -1491,13 +1536,30 @@ struct Index {
   private saveSettings(): void {
     const context: common.UIAbilityContext = this.getUIContext().getHostContext() as common.UIAbilityContext;
     const fallback: VoiceSettings = defaultVoiceSettings();
+    const ttsModel: string = this.vtTtsModel.trim() === '' ? fallback.cloud.ttsModel : this.vtTtsModel.trim();
+    let ttsVoice: string = this.vtTtsVoice.trim() === '' ? fallback.cloud.ttsVoice : this.vtTtsVoice.trim();
+    // 音色和模型是两条产品线：longanyang 属 CosyVoice，Cherry/Ethan 属 Qwen-TTS。填错会 400。
+    const cosy: boolean = ttsModel.toLowerCase().startsWith('cosyvoice');
+    let voiceFixed: boolean = false;
+    if (cosy && /^(cherry|ethan|serena|chelsie|dylan|jada|sunny)$/i.test(ttsVoice)) {
+      ttsVoice = 'longanyang';
+      voiceFixed = true;
+    } else if (!cosy && /^long/i.test(ttsVoice)) {
+      ttsVoice = 'Cherry';
+      voiceFixed = true;
+    }
+    const asrBase: string = this.vtAsrBase.trim() === '' ? fallback.cloud.asrBase : this.vtAsrBase.trim();
+    const ttsBaseIn: string = this.vtTtsBase.trim() === '' ? fallback.cloud.ttsBase : this.vtTtsBase.trim();
+    // 百炼业务空间域名与公共域名是两套 key：朗读 Base 跟着识别 Base 走，否则朗读必 403。
+    const ttsBase: string = deriveTtsBase(asrBase, ttsBaseIn);
+    const baseMoved: boolean = ttsBase !== ttsBaseIn;
     const cloud: CloudVoiceSettings = {
       key: this.vtKey.trim(),
-      asrBase: this.vtAsrBase.trim() === '' ? fallback.cloud.asrBase : this.vtAsrBase.trim(),
+      asrBase: asrBase,
       asrModel: this.vtAsrModel.trim() === '' ? fallback.cloud.asrModel : this.vtAsrModel.trim(),
-      ttsBase: this.vtTtsBase.trim() === '' ? fallback.cloud.ttsBase : this.vtTtsBase.trim(),
-      ttsModel: this.vtTtsModel.trim() === '' ? fallback.cloud.ttsModel : this.vtTtsModel.trim(),
-      ttsVoice: this.vtTtsVoice.trim() === '' ? fallback.cloud.ttsVoice : this.vtTtsVoice.trim()
+      ttsBase: ttsBase,
+      ttsModel: ttsModel,
+      ttsVoice: ttsVoice
     };
     const settings: VoiceSettings = {
       recognizer: this.vtRecognizer,
@@ -1506,8 +1568,24 @@ struct Index {
       cloud: cloud
     };
     const ok: boolean = writeVoiceSettings(context, settings);
-    this.settingsNote = ok
-      ? `已保存：识别=${recognizerLabel(this.vtRecognizer)}，停顿=${pauseLabel(this.vtPause)}，朗读=${voiceLabel(this.vtVoice)}`
-      : '保存失败：写不进运行目录，检查存储权限';
+    if (!ok) {
+      this.settingsNote = '保存失败：写不进运行目录，检查存储权限';
+      return;
+    }
+    if (baseMoved) {
+      this.vtTtsBase = ttsBase;
+    }
+    if (voiceFixed) {
+      this.vtTtsVoice = ttsVoice;
+    }
+    const fixes: string[] = [];
+    if (baseMoved) {
+      fixes.push(`朗读 Base 已跟随识别域名改成 ${ttsBase}`);
+    }
+    if (voiceFixed) {
+      fixes.push(`音色已按模型改成 ${ttsVoice}`);
+    }
+    const base: string = `已保存：识别=${recognizerLabel(this.vtRecognizer)}，停顿=${pauseLabel(this.vtPause)}，朗读=${voiceLabel(this.vtVoice)}`;
+    this.settingsNote = fixes.length === 0 ? base : `${base}（${fixes.join('；')}）`;
   }
 }

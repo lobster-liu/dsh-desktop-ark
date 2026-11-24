@@ -72,7 +72,39 @@ function objectOf(source: Record<string, Object>, key: string): Record<string, O
   return value as Record<string, Object>;
 }
 
-/** 规范化：坏值一律回默认，保证 UI 与 Node 侧看到同一套值。 */
+/** 取 `scheme://host`（ArkTS 没有全局 URL，用正则切）。 */
+function originOf(value: string): string {
+  const match: string[] | null = new RegExp('^[a-zA-Z][a-zA-Z0-9+.-]*://[^/?#]+').exec(value);
+  return match === null ? '' : match[0].toLowerCase();
+}
+
+/** 取域名部分。 */
+function hostOf(value: string): string {
+  const origin: string = originOf(value);
+  const match: string[] | null = new RegExp('^[a-zA-Z][a-zA-Z0-9+.-]*://([^/?#]+)').exec(origin);
+  return match === null ? '' : match[1].toLowerCase();
+}
+
+/**
+ * 百炼「业务空间专属域名」（ws-xxxx.cn-beijing.maas.aliyuncs.com）与公共域名是两套 key。
+ * 用户只改了识别 Base 时，把朗读 Base 一起挪到同一域名下（仍是 `/api/v1`），否则朗读必然 403。
+ */
+export function deriveTtsBase(asrBase: string, ttsBase: string): string {
+  const fallback: string = defaultVoiceSettings().cloud.ttsBase;
+  const chosen: string = ttsBase === '' ? fallback : ttsBase;
+  const publicHost: string = 'dashscope.aliyuncs.com';
+  const asrHost: string = hostOf(asrBase);
+  const ttsHost: string = hostOf(chosen);
+  if (asrHost === '' || ttsHost === '') {
+    return chosen;
+  }
+  const asrOrigin: string = originOf(asrBase);
+  if (asrOrigin !== '' && ttsHost === publicHost && asrHost !== publicHost) {
+    return `${asrOrigin}/api/v1`;
+  }
+  return chosen;
+}
+
 export function normalizeVoiceSettings(raw: Object | undefined): VoiceSettings {
   const fallback: VoiceSettings = defaultVoiceSettings();
   if (raw === undefined || raw === null || typeof raw !== 'object') {
@@ -92,11 +124,12 @@ export function normalizeVoiceSettings(raw: Object | undefined): VoiceSettings {
   if (pause !== 'quick' && pause !== 'normal' && pause !== 'patient') {
     pause = fallback.pause;
   }
+  const asrBase: string = pick(cloudIn, 'asrBase', fallback.cloud.asrBase);
   const cloud: CloudVoiceSettings = {
     key: pick(cloudIn, 'key', fallback.cloud.key),
-    asrBase: pick(cloudIn, 'asrBase', fallback.cloud.asrBase),
+    asrBase: asrBase,
     asrModel: pick(cloudIn, 'asrModel', fallback.cloud.asrModel),
-    ttsBase: pick(cloudIn, 'ttsBase', fallback.cloud.ttsBase),
+    ttsBase: deriveTtsBase(asrBase, pick(cloudIn, 'ttsBase', fallback.cloud.ttsBase)),
     ttsModel: pick(cloudIn, 'ttsModel', fallback.cloud.ttsModel),
     ttsVoice: pick(cloudIn, 'ttsVoice', fallback.cloud.ttsVoice)
   };

@@ -92,6 +92,27 @@ function sweep(dir) {
 }
 
 /**
+ * 从上游错误体里提炼一句人能读的原因。
+ * @param {string} raw
+ * @returns {string}
+ */
+function reasonOf(raw) {
+  if (!raw) {
+    return ''
+  }
+  try {
+    const parsed = JSON.parse(raw)
+    const error = parsed?.error ?? parsed
+    const code = String(error?.code ?? '')
+    const message = String(error?.message ?? '')
+    const joined = [code, message].filter((part) => part !== '').join(' · ')
+    return joined === '' ? '' : `：${joined.slice(0, 240)}`
+  } catch (failure) {
+    return `：${raw.slice(0, 160)}`
+  }
+}
+
+/**
  * 从阿里云响应里取音频：优先 URL，其次 Base64。
  * @param {unknown} parsed
  * @returns {{ url: string, data: string, ext: string }}
@@ -137,7 +158,7 @@ export async function synthesizeCloud(text, cloud) {
   })
   const raw = Buffer.from(await response.arrayBuffer()).toString('utf8')
   if (!response.ok) {
-    throw new Error(`云端合成失败 HTTP ${response.status}: ${raw.slice(0, 300)}`)
+    throw new Error(`云端合成失败 HTTP ${response.status}${reasonOf(raw)}`)
   }
   let parsed
   try {
