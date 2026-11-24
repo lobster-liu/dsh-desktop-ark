@@ -1342,9 +1342,14 @@ struct Index {
                   .width('100%')
                 Flex({ wrap: FlexWrap.Wrap }) {
                   this.chipTtsPreset('Qwen3-TTS-Flash · Cherry', 'qwen3-tts-flash', 'Cherry')
-                  this.chipTtsPreset('CosyVoice-v3.5-Flash · longanyang', 'cosyvoice-v3.5-flash', 'longanyang')
+                  this.chipTtsPreset('CosyVoice-v3-Flash · longanyang', 'cosyvoice-v3-flash', 'longanyang')
+                  this.chipTtsPreset('CosyVoice-v3-Flash · longcheng_v3', 'cosyvoice-v3-flash', 'longcheng_v3')
                 }
                 .width('100%')
+                Text('v3.5-flash 只接受克隆/设计音色（cosyvoice-v3.5-flash-xxxx），系统音色请用 v3-flash')
+                  .fontSize(10)
+                  .fontColor('#9CA3AF')
+                  .width('100%')
                 TextInput({ text: this.vtTtsModel, placeholder: 'qwen3-tts-flash / cosyvoice-v3.5-flash' })
                   .fontSize(12)
                   .height(40)
@@ -1539,14 +1544,20 @@ struct Index {
     const ttsModel: string = this.vtTtsModel.trim() === '' ? fallback.cloud.ttsModel : this.vtTtsModel.trim();
     let ttsVoice: string = this.vtTtsVoice.trim() === '' ? fallback.cloud.ttsVoice : this.vtTtsVoice.trim();
     // 音色和模型是两条产品线：longanyang 属 CosyVoice，Cherry/Ethan 属 Qwen-TTS。填错会 400。
+    // 例外：cosyvoice-v3.5-* 只接受克隆/设计音色 ID，系统音色一律 Invalid voice，所以不自动改写、只提示。
     const cosy: boolean = ttsModel.toLowerCase().startsWith('cosyvoice');
+    const cosy35: boolean = /^cosyvoice-v3\.5/i.test(ttsModel);
+    const cloneVoice: boolean = /^cosyvoice-v3\.5-(flash|plus)-/i.test(ttsVoice);
     let voiceFixed: boolean = false;
-    if (cosy && /^(cherry|ethan|serena|chelsie|dylan|jada|sunny)$/i.test(ttsVoice)) {
+    let voiceWarn: boolean = false;
+    if (cosy && !cosy35 && /^(cherry|ethan|serena|chelsie|dylan|jada|sunny)$/i.test(ttsVoice)) {
       ttsVoice = 'longanyang';
       voiceFixed = true;
     } else if (!cosy && /^long/i.test(ttsVoice)) {
       ttsVoice = 'Cherry';
       voiceFixed = true;
+    } else if (cosy35 && !cloneVoice) {
+      voiceWarn = true;
     }
     const asrBase: string = this.vtAsrBase.trim() === '' ? fallback.cloud.asrBase : this.vtAsrBase.trim();
     const ttsBaseIn: string = this.vtTtsBase.trim() === '' ? fallback.cloud.ttsBase : this.vtTtsBase.trim();
@@ -1584,6 +1595,9 @@ struct Index {
     }
     if (voiceFixed) {
       fixes.push(`音色已按模型改成 ${ttsVoice}`);
+    }
+    if (voiceWarn) {
+      fixes.push('v3.5-flash 只认克隆/设计音色 ID，系统音色请改用 cosyvoice-v3-flash');
     }
     const base: string = `已保存：识别=${recognizerLabel(this.vtRecognizer)}，停顿=${pauseLabel(this.vtPause)}，朗读=${voiceLabel(this.vtVoice)}`;
     this.settingsNote = fixes.length === 0 ? base : `${base}（${fixes.join('；')}）`;
