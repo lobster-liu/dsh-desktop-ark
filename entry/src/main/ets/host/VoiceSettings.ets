@@ -33,6 +33,8 @@ export interface VoiceSettings {
   pause: string;
   /** 麦克风策略：auto（手机麦优先）/ bluetooth（蓝牙耳机优先）/ phone（只用手机麦）。 */
   mic: string;
+  /** 实时字幕：on 时边说边显字（流式识别），off 时走原来的「录完再识别」。 */
+  caption: string;
   cloud: CloudVoiceSettings;
 }
 
@@ -46,7 +48,14 @@ export function defaultVoiceSettings(): VoiceSettings {
     ttsModel: 'qwen3-tts-flash',
     ttsVoice: 'Cherry'
   };
-  const settings: VoiceSettings = { recognizer: 'auto', voice: 'system', pause: 'normal', mic: 'auto', cloud: cloud };
+  const settings: VoiceSettings = {
+    recognizer: 'auto',
+    voice: 'system',
+    pause: 'normal',
+    mic: 'auto',
+    caption: 'off',
+    cloud: cloud
+  };
   return settings;
 }
 
@@ -130,6 +139,10 @@ export function normalizeVoiceSettings(raw: Object | undefined): VoiceSettings {
   if (mic !== 'auto' && mic !== 'bluetooth' && mic !== 'phone') {
     mic = fallback.mic;
   }
+  let caption: string = pick(source, 'caption', fallback.caption);
+  if (caption !== 'on' && caption !== 'off') {
+    caption = fallback.caption;
+  }
   const asrBase: string = pick(cloudIn, 'asrBase', fallback.cloud.asrBase);
   const cloud: CloudVoiceSettings = {
     key: pick(cloudIn, 'key', fallback.cloud.key),
@@ -139,7 +152,14 @@ export function normalizeVoiceSettings(raw: Object | undefined): VoiceSettings {
     ttsModel: pick(cloudIn, 'ttsModel', fallback.cloud.ttsModel),
     ttsVoice: pick(cloudIn, 'ttsVoice', fallback.cloud.ttsVoice)
   };
-  const settings: VoiceSettings = { recognizer: recognizer, voice: voice, pause: pause, mic: mic, cloud: cloud };
+  const settings: VoiceSettings = {
+    recognizer: recognizer,
+    voice: voice,
+    pause: pause,
+    mic: mic,
+    caption: caption,
+    cloud: cloud
+  };
   return settings;
 }
 
@@ -236,4 +256,9 @@ export function micLabel(mode: string): string {
     return '只用手机麦';
   }
   return '自动（手机麦优先）';
+}
+
+/** 实时字幕的中文标签。 */
+export function captionLabel(mode: string): string {
+  return mode === 'on' ? '实时字幕（边说边显字）' : '关闭（录完再识别）';
 }

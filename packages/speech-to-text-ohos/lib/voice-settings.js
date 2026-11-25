@@ -27,6 +27,7 @@ export const DEFAULT_SETTINGS = {
   voice: 'system',
   pause: 'normal',
   mic: 'auto',
+  caption: 'off',
   cloud: {
     key: '',
     asrBase: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
@@ -43,6 +44,8 @@ const VOICES = ['system', 'cloud']
 const PAUSES = ['quick', 'normal', 'patient']
 /** 麦克风策略：auto（手机麦优先）/ bluetooth（蓝牙耳机优先）/ phone（只用手机麦）。 */
 const MICS = ['auto', 'bluetooth', 'phone']
+/** 实时字幕开关：on 边说边显字（流式识别）/ off 录完再识别。 */
+const CAPTIONS = ['on', 'off']
 
 /**
  * 运行目录（`<files>/runtime`），与 `runtimeDir()` 一致：`DSH_HOME` 是 `<files>/dsh-home`。
@@ -107,12 +110,14 @@ export function normalizeSettings(raw) {
   const voice = VOICES.includes(String(input.voice)) ? String(input.voice) : DEFAULT_SETTINGS.voice
   const pause = PAUSES.includes(String(input.pause)) ? String(input.pause) : DEFAULT_SETTINGS.pause
   const mic = MICS.includes(String(input.mic)) ? String(input.mic) : DEFAULT_SETTINGS.mic
+  const caption = CAPTIONS.includes(String(input.caption)) ? String(input.caption) : DEFAULT_SETTINGS.caption
   const asrBase = text(cloudIn.asrBase) || DEFAULT_SETTINGS.cloud.asrBase
   return {
     recognizer,
     voice,
     pause,
     mic,
+    caption,
     cloud: {
       key: text(cloudIn.key),
       asrBase,

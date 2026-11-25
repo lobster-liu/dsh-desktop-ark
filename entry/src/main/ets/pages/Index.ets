@@ -11,6 +11,7 @@ import {
   CloudVoiceSettings,
   defaultVoiceSettings,
   deriveTtsBase,
+  captionLabel,
   micLabel,
   pauseLabel,
   pauseSilenceMs,
@@ -25,6 +26,27 @@ interface PageReplyState {
   state?: string;
   reply?: string;
   items?: number;
+}
+
+/** `speech.captionSnapshot` 的快照（流式字幕）。*/
+interface CaptionSnapshot {
+  active?: boolean;
+  text?: string;
+  final?: string;
+  interim?: string;
+  rms?: number;
+  peak?: number;
+  voicedMs?: number;
+  silenceMs?: number;
+  sessions?: number;
+  error?: string;
+}
+
+/** `speech.captionStop` 的返回：累计文本。*/
+interface CaptionStopReply {
+  ok?: boolean;
+  text?: string;
+  sessions?: number;
 }
 
 /** `/_ohos/speech/cloud-asr` 的返回结构。*/
@@ -126,6 +148,7 @@ struct Index {
   @State vtPause: string = 'normal';
   @State vtVoice: string = 'system';
   @State vtMic: string = 'auto';
+  @State vtCaption: string = 'off';
   @State vtKey: string = '';
   @State vtAsrBase: string = '';
   @State vtAsrModel: string = '';
@@ -694,6 +717,13 @@ struct Index {
     if (this.callState !== 'idle' && this.callState !== 'error' && this.callState !== 'speaking') {
       return;
     }
+    // 实时字幕模式走另一条采集链路：麦克风一直读、边说边显字，停顿后自动发送。
+    // 半双工那条（录完 → 整段识别）在这里直接跳过，两者互斥。
+    const early: common.UIAbilityContext = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    if (readVoiceSettings(early).caption === 'on') {
+      await this.runLiveCallTurn();
+      return;
+    }
     const turnId: number = ++this.callTurnId;
     const context: common.UIAbilityContext = this.getUIContext().getHostContext() as common.UIAbilityContext;
     // 先掐掉上一轮还在念的回复：否则麦克风会把喇叭里的声音录进去，音频焦点也会打架。
@@ -818,6 +848,16 @@ struct Index {
         return;
       }
     }
+    await this.finishTurn(turnId, context, text, settings, engineNote);
+  }
+
+  /**
+   * 把一句话送进会话、等回复、朗读回复（半双工与流式字幕两条路共用）。
+   *
+   * `engineNote` 只用于状态行，说明这段文本是云端识别还是离线的。
+   */
+  private async finishTurn(turnId: number, context: common.UIAbilityContext, text: string,
+    settings: VoiceSettings, engineNote: string): Promise<void> {
     this.callTranscript = text;
     this.callState = 'sending';
     this.callStatus = `正在发送给 DSH…（识别：${engineNote}）`;
@@ -869,6 +909,83 @@ struct Index {
     }
     this.callState = 'idle';
     this.callStatus = '说完了，点「说话」继续';
+  }
+
+  /**
+   * 流式字幕模式的一轮通话：边说边显字，停顿够久就自动结束并发送。
+   *
+   * 和半双工的区别只在采集：半双工是「录完 → 整段识别」，这里麦克风一直读、640B/20ms
+   * 喂给识别引擎，字幕随 partial 结果实时刷新；结束后拿累计文本走同一条发送/朗读链路。
+   */
+  private async runLiveCallTurn(): Promise<void> {
+    if (this.callState !== 'idle' && this.callState !== 'error' && this.callState !== 'speaking') {
+      return;
+    }
+    const turnId: number = ++this.callTurnId;
+    const context: common.UIAbilityContext = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    await HostCapabilities.stopSpeakForCall(context);
+    if (!this.liveTurn(turnId)) {
+      return;
+    }
+    this.callTranscript = '';
+    this.callReply = '';
+    this.callCloudNote = '';
+    this.callSource = '';
+    try {
+      await this.evalInPage(this.buildBlurScript());
+    } catch (error) {
+      // 收不掉也不影响录音。
+    }
+    const settings: VoiceSettings = readVoiceSettings(context);
+    const silenceMs: number = pauseSilenceMs(settings.pause);
+    this.callState = 'listening';
+    this.callStatus = '正在听你说…（边说边显字，停顿后自动发送）';
+    const started: string = await HostCapabilities.startCaptionForCall(context, JSON.stringify({ mic: settings.mic }));
+    if (started !== 'ok') {
+      this.callState = 'error';
+      this.callStatus = started === 'mic-denied' ? '没有麦克风权限' : `字幕启动失败：${started}`;
+      return;
+    }
+    let waited: number = 0;
+    while (this.liveTurn(turnId)) {
+      await this.sleep(250);
+      waited += 250;
+      const raw: string = await HostCapabilities.captionSnapshotForCall();
+      const snap: CaptionSnapshot = raw === '' ? {} : (JSON.parse(raw) as CaptionSnapshot);
+      const live: string = (snap.text ?? '').trim();
+      if (live !== '') {
+        this.callTranscript = live;
+      }
+      this.callSource = `字幕中 · 峰值 ${snap.peak ?? 0}`;
+      // 说过话之后静音够久就算说完（和半双工的停顿档位同一个口径）。
+      if ((snap.voicedMs ?? 0) >= 400 && (snap.silenceMs ?? 0) >= silenceMs) {
+        break;
+      }
+      // 8 秒内一句人声都没听到：与其让用户对着屏幕等满 30 秒，不如直接说「没听清」。
+      if (waited >= 8000 && (snap.voicedMs ?? 0) === 0) {
+        break;
+      }
+      if (waited >= 30000) {
+        break;
+      }
+    }
+    const stoppedRaw: string = await HostCapabilities.stopCaptionForCall();
+    let finalText: string = '';
+    try {
+      finalText = ((JSON.parse(stoppedRaw) as CaptionStopReply).text ?? '').trim();
+    } catch (error) {
+      finalText = this.callTranscript.trim();
+    }
+    if (!this.liveTurn(turnId)) {
+      return;
+    }
+    if (finalText === '') {
+      this.callState = 'error';
+      this.callStatus = '没听清，再说一次（靠近手机、说完整一句）';
+      return;
+    }
+    this.callSource = `流式字幕 · ${(waited / 1000).toFixed(1)} 秒`;
+    await this.finishTurn(turnId, context, finalText, settings, '流式字幕');
   }
 
   /**
@@ -1462,6 +1579,20 @@ struct Index {
               }
               .width('100%')
 
+              Text('实时字幕')
+                .fontSize(12)
+                .fontColor('#6B7280')
+                .width('100%')
+              Flex({ wrap: FlexWrap.Wrap }) {
+                this.chipCaption('关闭（录完再识别）', 'off')
+                this.chipCaption('开（边说边显字）', 'on')
+              }
+              .width('100%')
+              Text('开启后麦克风一直开着，说话时面板上实时出字，停顿够久自动发送；关闭则是说完再整段识别。')
+                .fontSize(10)
+                .fontColor('#9CA3AF')
+                .width('100%')
+
               Text('云端服务（阿里云百炼，或其他 OpenAI 兼容服务）')
                 .fontSize(12)
                 .fontColor('#6B7280')
@@ -1668,6 +1799,21 @@ struct Index {
       })
   }
 
+  /** 实时字幕开关芯片。*/
+  @Builder
+  chipCaption(label: string, value: string) {
+    Text(label)
+      .fontSize(12)
+      .fontColor(this.vtCaption === value ? '#0B3B34' : '#374151')
+      .padding({ left: 10, right: 10, top: 6, bottom: 6 })
+      .margin({ right: 6, bottom: 6 })
+      .borderRadius(14)
+      .backgroundColor(this.vtCaption === value ? '#7FD3C4' : '#F1F5F4')
+      .onClick((): void => {
+        this.vtCaption = value;
+      })
+  }
+
   /** 朗读来源芯片。*/
   @Builder
   chipVoice(label: string, value: string) {
@@ -1737,6 +1883,7 @@ struct Index {
     this.vtPause = settings.pause;
     this.vtVoice = settings.voice;
     this.vtMic = settings.mic;
+    this.vtCaption = settings.caption;
     this.vtKey = settings.cloud.key;
     this.vtAsrBase = settings.cloud.asrBase;
     this.vtAsrModel = settings.cloud.asrModel;
@@ -1787,6 +1934,7 @@ struct Index {
       voice: this.vtVoice,
       pause: this.vtPause,
       mic: this.vtMic,
+      caption: this.vtCaption,
       cloud: cloud
     };
     const ok: boolean = writeVoiceSettings(context, settings);
@@ -1810,7 +1958,7 @@ struct Index {
     if (voiceWarn) {
       fixes.push('v3.5-flash 只认克隆/设计音色 ID，系统音色请改用 cosyvoice-v3-flash');
     }
-    const base: string = `已保存：识别=${recognizerLabel(this.vtRecognizer)}，麦克风=${micLabel(this.vtMic)}，停顿=${pauseLabel(this.vtPause)}，朗读=${voiceLabel(this.vtVoice)}`;
+    const base: string = `已保存：识别=${recognizerLabel(this.vtRecognizer)}，麦克风=${micLabel(this.vtMic)}，停顿=${pauseLabel(this.vtPause)}，朗读=${voiceLabel(this.vtVoice)}，字幕=${captionLabel(this.vtCaption)}`;
     this.settingsNote = fixes.length === 0 ? base : `${base}（${fixes.join('；')}）`;
   }
 }

@@ -147,6 +147,12 @@ interface RecordResult {
   code?: string;
 }
 
+/** `speech.captionStart` 的返回：`ok` 或失败原因。 */
+interface CaptionStartReply {
+  ok?: boolean;
+  error?: string;
+}
+
 /** `speech.speak` 入参：要朗读的文本与语音参数。 */
 interface SpeakArgs {
   text?: string;
@@ -358,6 +364,10 @@ export class HostCapabilities {
     // 语音合成：半双工通话里把模型的回复念出来（系统离线 TTS）。
     host.register('speech.speak', (args: string): Promise<string> => HostCapabilities.speak(context, args));
     host.register('speech.speakStop', (args: string): Promise<string> => HostCapabilities.stopSpeak());
+    // 流式字幕：边说边出字（全双工的地基）。start 之后靠 snapshot 轮询，stop 拿最终文本。
+    host.register('speech.captionStart', (args: string): Promise<string> => HostCapabilities.startCaption(context, args));
+    host.register('speech.captionStop', (_args: string): Promise<string> => HostCapabilities.stopCaption());
+    host.register('speech.captionSnapshot', (_args: string): string => HostCapabilities.captionSnapshot());
 
     // 已注册但未实现：显式返回 not-implemented（宪法 C2）。
     HostCapabilities.notImplemented(host, 'fs.saveFile', '导出将在 P2 提供');
@@ -1336,6 +1346,27 @@ export class HostCapabilities {
     return JSON.parse(raw) as SpeakResult;
   }
 
+  /** 流式字幕：开始监听。返回 `ok` 或失败原因（`mic-denied` / 引擎错误码）。*/
+  static async startCaptionForCall(context: common.UIAbilityContext, args: string): Promise<string> {
+    const raw: string = await HostCapabilities.startCaption(context, args);
+    try {
+      const parsed: CaptionStartReply = JSON.parse(raw) as CaptionStartReply;
+      return parsed.ok === true ? 'ok' : (parsed.error ?? 'unknown');
+    } catch (error) {
+      return 'parse-error';
+    }
+  }
+
+  /** 流式字幕：当前快照（页面每 250ms 轮询一次）。*/
+  static async captionSnapshotForCall(): Promise<string> {
+    return HostCapabilities.captionSnapshot();
+  }
+
+  /** 流式字幕：停止并取回累计文本。*/
+  static async stopCaptionForCall(): Promise<string> {
+    return HostCapabilities.stopCaption();
+  }
+
   private static async recognizeSpeech(context: common.UIAbilityContext, args: string): Promise<string> {
     let engine: speechRecognizer.SpeechRecognitionEngine | null = null;
     let fd: number = -1;
@@ -1562,6 +1593,306 @@ export class HostCapabilities {
         }
       }
     }
+  }
+
+  // ---------------- 流式字幕（全双工的地基） ----------------
+  //
+  // 半双工的做法是「录完 → 识别」，识别要等说话结束。流式字幕反过来：麦克风一直读，
+  // 640B/20ms 喂给识别引擎，边喂边出 partial 文本。这样面板可以「边说边显字」，
+  // 也为全双工（朗读期间继续听、用户一开口就打断朗读）留出接口。
+  //
+  // 引擎限制（沿用 DSH Go 的 HmsStreamingAsr）：一段会话约 3 秒会被引擎自己收尾，
+  // 收尾后就换一个新会话接着喂；writeAudio 单次只能 640/1280 字节、按 20ms 节奏，
+  // 一次塞完会报 1002200004。onComplete 之后不要再往旧会话写（1002200010）。
+
+  private static captionActive: boolean = false;
+  private static captionEngine: speechRecognizer.SpeechRecognitionEngine | null = null;
+  private static captionCapturer: audio.AudioCapturer | null = null;
+  private static captionQueue: Uint8Array[] = [];
+  private static captionFinalText: string = '';
+  private static captionInterimText: string = '';
+  private static captionRms: number = 0;
+  private static captionPeak: number = 0;
+  private static captionVoicedMs: number = 0;
+  private static captionSilenceMs: number = 0;
+  private static captionSessions: number = 0;
+  private static captionError: string = '';
+  private static captionNoise: number = 80;
+  private static captionTask: Promise<void> | null = null;
+
+  /** 开始流式字幕：开麦克风 + 建引擎，返回 `{ok}`。*/
+  static async startCaption(context: common.UIAbilityContext, args: string): Promise<string> {
+    if (HostCapabilities.captionActive) {
+      return JSON.stringify({ ok: false, error: 'already-running' });
+    }
+    const allowed: boolean = await HostCapabilities.ensureMicrophone(context);
+    if (!allowed) {
+      return JSON.stringify({ ok: false, error: 'mic-denied' });
+    }
+    HostCapabilities.captionFinalText = '';
+    HostCapabilities.captionInterimText = '';
+    HostCapabilities.captionRms = 0;
+    HostCapabilities.captionPeak = 0;
+    HostCapabilities.captionVoicedMs = 0;
+    HostCapabilities.captionSilenceMs = 0;
+    HostCapabilities.captionSessions = 0;
+    HostCapabilities.captionError = '';
+    HostCapabilities.captionNoise = 80;
+    HostCapabilities.captionQueue = [];
+    try {
+      const created: speechRecognizer.SpeechRecognitionEngine = await speechRecognizer.createEngine({
+        language: 'zh-CN',
+        online: 1,
+        extraParams: { recognizerMode: 'long', locate: 'CN' }
+      });
+      HostCapabilities.captionEngine = created;
+      const recorder: audio.AudioCapturer = await audio.createAudioCapturer({
+        streamInfo: {
+          samplingRate: 16000,
+          channels: audio.AudioChannel.CHANNEL_1,
+          sampleFormat: audio.AudioSampleFormat.SAMPLE_FORMAT_S16LE,
+          encodingType: audio.AudioEncodingType.ENCODING_TYPE_RAW
+        },
+        capturerInfo: {
+          source: audio.SourceType.SOURCE_TYPE_VOICE_RECOGNITION,
+          capturerFlags: 0
+        }
+      });
+      HostCapabilities.captionCapturer = recorder;
+      const streamInfo: audio.AudioStreamInfo = recorder.getStreamInfoSync();
+      const rate: number = streamInfo.samplingRate;
+      const ratio: number = rate > 16000 ? Math.round(rate / 16000) : 1;
+      recorder.on('readData', (buffer: ArrayBuffer): void => {
+        if (!HostCapabilities.captionActive) {
+          return;
+        }
+        let chunk: ArrayBuffer = buffer;
+        if (ratio > 1) {
+          const input: Int16Array = new Int16Array(buffer);
+          const outLength: number = Math.floor(input.length / ratio);
+          const output: Int16Array = new Int16Array(outLength);
+          for (let i = 0; i < outLength; i++) {
+            output[i] = input[i * ratio];
+          }
+          chunk = output.buffer as ArrayBuffer;
+        }
+        const view: Int16Array = new Int16Array(chunk);
+        if (view.length === 0) {
+          return;
+        }
+        let chunkSquares: number = 0;
+        let peak: number = 0;
+        for (let i = 0; i < view.length; i++) {
+          const value: number = view[i];
+          const magnitude: number = value < 0 ? -value : value;
+          if (magnitude > peak) {
+            peak = magnitude;
+          }
+          chunkSquares += value * value;
+        }
+        const chunkMs: number = (view.length / 16000) * 1000;
+        const chunkRms: number = Math.sqrt(chunkSquares / view.length);
+        HostCapabilities.captionRms = chunkRms;
+        if (peak > HostCapabilities.captionPeak) {
+          HostCapabilities.captionPeak = peak;
+        }
+        if (chunkRms < HostCapabilities.captionNoise) {
+          HostCapabilities.captionNoise = HostCapabilities.captionNoise * 0.7 + chunkRms * 0.3;
+        }
+        const threshold: number = Math.max(300, HostCapabilities.captionNoise * 3);
+        if (chunkRms >= threshold) {
+          HostCapabilities.captionVoicedMs += chunkMs;
+          HostCapabilities.captionSilenceMs = 0;
+        } else {
+          HostCapabilities.captionSilenceMs += chunkMs;
+        }
+        // 队列封顶 10 秒：引擎跟不上时宁可丢最旧的块，也不让内存无上限增长。
+        if (HostCapabilities.captionQueue.length > 500) {
+          HostCapabilities.captionQueue.shift();
+        }
+        HostCapabilities.captionQueue.push(new Uint8Array(chunk));
+      });
+      await recorder.start();
+      HostCapabilities.captionActive = true;
+      HostCapabilities.captionTask = HostCapabilities.captionFeed(context);
+      HostCapabilities.appLog(context, 'speech.caption 开始（流式字幕）');
+      return JSON.stringify({ ok: true });
+    } catch (error) {
+      const failed: BusinessError = error as BusinessError;
+      HostCapabilities.captionError = `${failed.code} · ${failed.message}`;
+      HostCapabilities.appLog(context, 'speech.caption 启动失败：' + HostCapabilities.captionError);
+      await HostCapabilities.stopCaption();
+      return JSON.stringify({ ok: false, error: HostCapabilities.captionError });
+    }
+  }
+
+  /** 当前字幕快照（页面侧轮询用，纯字符串避免桥上的结构化限制）。*/
+  static captionSnapshot(): string {
+    const ready: string = (HostCapabilities.captionFinalText + HostCapabilities.captionInterimText).trim();
+    return JSON.stringify({
+      active: HostCapabilities.captionActive,
+      text: ready,
+      final: HostCapabilities.captionFinalText,
+      interim: HostCapabilities.captionInterimText,
+      rms: Math.round(HostCapabilities.captionRms),
+      peak: HostCapabilities.captionPeak,
+      voicedMs: Math.round(HostCapabilities.captionVoicedMs),
+      silenceMs: Math.round(HostCapabilities.captionSilenceMs),
+      sessions: HostCapabilities.captionSessions,
+      error: HostCapabilities.captionError
+    });
+  }
+
+  /** 停流式字幕，返回已经识别的文本。*/
+  static async stopCaption(): Promise<string> {
+    const text: string = (HostCapabilities.captionFinalText + HostCapabilities.captionInterimText).trim();
+    HostCapabilities.captionActive = false;
+    const recorder: audio.AudioCapturer | null = HostCapabilities.captionCapturer;
+    HostCapabilities.captionCapturer = null;
+    if (recorder !== null) {
+      try {
+        await recorder.stop();
+      } catch (error) {
+        // 已经停了就算了。
+      }
+      try {
+        recorder.release();
+      } catch (error) {
+        // 同上。
+      }
+    }
+    const task: Promise<void> | null = HostCapabilities.captionTask;
+    HostCapabilities.captionTask = null;
+    if (task !== null) {
+      try {
+        await task;
+      } catch (error) {
+        // 喂数据循环出错不影响已经拿到的文本。
+      }
+    }
+    const engine: speechRecognizer.SpeechRecognitionEngine | null = HostCapabilities.captionEngine;
+    HostCapabilities.captionEngine = null;
+    if (engine !== null) {
+      try {
+        engine.shutdown();
+      } catch (error) {
+        // 引擎可能已被释放。
+      }
+    }
+    return JSON.stringify({ ok: true, text: text, sessions: HostCapabilities.captionSessions });
+  }
+
+  /**
+   * 喂数据循环：一段会话装不下整句（引擎约 3 秒自己收尾），收尾就换新会话接着喂。
+   *
+   * 只用 `isFinal` 累加最终文本；`interim` 单独留着给「边说边显」用，句子定型后清空，
+   * 否则同一句话会在界面上重复出现两次。
+   */
+  private static async captionFeed(context: common.UIAbilityContext): Promise<void> {
+    const audioInfo: speechRecognizer.AudioInfo = {
+      audioType: 'pcm',
+      sampleRate: 16000,
+      soundChannel: 1,
+      sampleBit: 16
+    };
+    let sessionId: string = '';
+    let resolved: boolean = false;
+    let sessionFinal: string = '';
+    while (HostCapabilities.captionActive) {
+      const engine: speechRecognizer.SpeechRecognitionEngine | null = HostCapabilities.captionEngine;
+      if (engine === null) {
+        break;
+      }
+      HostCapabilities.captionSessions += 1;
+      sessionId = 'caption-' + Date.now() + '-' + HostCapabilities.captionSessions;
+      resolved = false;
+      sessionFinal = '';
+      let started: boolean = false;
+      engine.setListener({
+        onStart: (_id: string, _msg: string): void => {
+          started = true;
+        },
+        onEvent: (_id: string, _code: number, _msg: string): void => {
+        },
+        onResult: (_id: string, result: speechRecognizer.SpeechRecognitionResult): void => {
+          if (result.result.length === 0) {
+            return;
+          }
+          if (result.isFinal) {
+            sessionFinal = result.result;
+            HostCapabilities.captionFinalText = HostCapabilities.captionFinalText + result.result;
+            HostCapabilities.captionInterimText = '';
+          } else {
+            HostCapabilities.captionInterimText = result.result;
+          }
+        },
+        onComplete: (_id: string, _msg: string): void => {
+          resolved = true;
+        },
+        onError: (_id: string, code: number, message: string): void => {
+          HostCapabilities.captionError = code + ' · ' + message;
+          resolved = true;
+        }
+      });
+      try {
+        engine.startListening({
+          sessionId: sessionId,
+          audioInfo: audioInfo,
+          extraParams: {
+            recognitionMode: 1,
+            maxAudioDuration: 60000,
+            recognizerOption: { enablePartialResult: true }
+          }
+        });
+      } catch (error) {
+        const failed: BusinessError = error as BusinessError;
+        HostCapabilities.captionError = `${failed.code} · ${failed.message}`;
+        await HostCapabilities.delay(120);
+        continue;
+      }
+      let waited: number = 0;
+      while (!started && waited < 2000 && HostCapabilities.captionActive) {
+        await HostCapabilities.delay(50);
+        waited += 50;
+      }
+      let written: number = 0;
+      while (!resolved && HostCapabilities.captionActive) {
+        const chunk: Uint8Array | undefined = HostCapabilities.captionQueue.shift();
+        if (chunk === undefined) {
+          await HostCapabilities.delay(20);
+          continue;
+        }
+        try {
+          engine.writeAudio(sessionId, chunk);
+          written += chunk.byteLength;
+        } catch (error) {
+          const failed: BusinessError = error as BusinessError;
+          // 引擎已自行收尾：不是错误，换下一段。
+          if (`${failed.code}`.indexOf('1002200010') < 0) {
+            HostCapabilities.captionError = `${failed.code} · ${failed.message}`;
+          }
+          break;
+        }
+        await HostCapabilities.delay(HostCapabilities.SPEECH_CHUNK_PACE_MS);
+      }
+      try {
+        engine.finish(sessionId);
+      } catch (error) {
+        // 已经收尾过了。
+      }
+      // 给 onComplete / 最后一个 result 一点时间落地。
+      await HostCapabilities.delay(150);
+      const piece: string = sessionFinal.trim();
+      if (piece.length > 0 && HostCapabilities.captionFinalText.indexOf(piece) < 0) {
+        HostCapabilities.captionFinalText = HostCapabilities.captionFinalText + piece;
+      }
+      HostCapabilities.captionInterimText = '';
+      if (written === 0) {
+        // 这一段一个字节都没喂进去：等一会儿再起新会话，别把 CPU 打满。
+        await HostCapabilities.delay(200);
+      }
+    }
+    HostCapabilities.appLog(context, 'speech.caption 结束（sessions=' + HostCapabilities.captionSessions + '）');
   }
 
   /** 申请麦克风权限；已授权时不弹窗（`requestPermissionsFromUser` 对已授权项直接返回 0）。 */

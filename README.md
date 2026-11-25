@@ -70,9 +70,11 @@ The glass orb in the top-right corner of a conversation is the voice-call entry:
 | Read aloud | Cloud `qwen3-tts-flash` / `cosyvoice-v3-flash` (chunked, 3-way concurrent, concatenated WAV) first, system TTS as fallback; output follows the system route (headset/glasses A2DP verified) |
 | Read reply | A turn counts as finished only when its cost footer (`本轮费用` / `timeEnd`) appears; reasoning blocks, progress rows and context-injection lines are skipped; 240 s window, and a timeout still speaks whatever text already arrived |
 
-Settings (recogniser, pause preset, voice source, microphone, cloud key/endpoints/models/voice) live in the panel's **Settings** sheet and persist to the app sandbox at `runtime/voice-settings.json`, shared by the ArkTS UI and the bundled Node side. Full chain, build steps and a troubleshooting table: [`docs/030-语音通话面板.md`](docs/030-语音通话面板.md).
+Settings (recogniser, pause preset, voice source, microphone, live captions, cloud key/endpoints/models/voice) live in the panel's **Settings** sheet and persist to the app sandbox at `runtime/voice-settings.json`, shared by the ArkTS UI and the bundled Node side. Full chain, build steps and a troubleshooting table: [`docs/030-语音通话面板.md`](docs/030-语音通话面板.md).
 
-Known limits: still **half-duplex** (you cannot talk while a reply is being read); full duplex and live captions are not implemented yet, and the system TTS truncates long texts, so long replies must go through cloud speech.
+Turning **live captions** on keeps the microphone open and streams words onto the panel as you speak (`640 B / 20 ms` into the recogniser, auto-send once you pause). It is the groundwork for full duplex; the host capabilities are `speech.captionStart / captionSnapshot / captionStop`.
+
+Known limits: sending is still **half-duplex** (the microphone is closed while a reply is being read, so the speaker never feeds back into the mic); the system TTS truncates long texts, so long replies must go through cloud speech.
 
 ## Status
 
