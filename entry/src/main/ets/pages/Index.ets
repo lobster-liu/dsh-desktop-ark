@@ -565,7 +565,6 @@ struct Index {
         }
         return JSON.stringify({ state: 'no-column', reply: '', items: 0 });
       }
-      const thinking = (document.body.innerText || '').indexOf('深度求索中') >= 0;
       // 尾部还有「本轮费。。¥0.005 + 未定价用。/ 16:09 / 已完成，用时 2秒」这类条目，
       // 直接取最后一条会拿到费用行；按噪音正则跳过它们再取。
       const noise = /(本轮费用|深度求索中|已完成|^\\s*\\d{1,2}:\\d{2}\\s*$)/;
@@ -591,17 +590,46 @@ struct Index {
         }
         return kept.join('\\n').trim();
       };
-      let reply = '';
+      // 一条助手轮次渲染完之后，末尾会追加一条「本轮费用 ≈ ¥0 + 未定价用量 / 16:30」的页脚
+      // （内含 [class*="timeEnd"]）。页脚出现 = 这条回复已经定型。在此之前读到的文字可能只是
+      // **思考过程**（真机反馈「只朗读了部分思考内容，真正的回复却没念」），所以先用页脚定位，
+      // 再从页脚往前找正文。
+      const rawOf = (item) => (item.innerText || '');
+      const isFooter = (item) => {
+        const t = rawOf(item);
+        if (/本轮费用|未定价用量/.test(t)) { return true; }
+        return item.querySelector('[class*="timeEnd"]') !== null;
+      };
+      // 思考块：有的轮次把推理渲染成独立条目（首行是「思考」/「推理」，或折在 details>summary 里），
+      // 正文和回答长得一样，直接念就成了「只念了思考」。
+      const isReasoning = (item) => {
+        const t = rawOf(item).replace(/^\\s+/, '');
+        if (t.indexOf('思考') === 0 || t.indexOf('推理') === 0) { return true; }
+        if (item.querySelector('[class*="hink"],[class*="eason"],[class*="hought"]') !== null) { return true; }
+        const det = item.querySelector('details');
+        if (det !== null) {
+          const sum = det.querySelector('summary');
+          if (sum !== null && /思考|推理|reason/i.test(sum.innerText || '')) { return true; }
+        }
+        return false;
+      };
+      let footerAt = -1;
       for (let i = items.length - 1; i >= 0; i--) {
+        if (isFooter(items[i])) { footerAt = i; break; }
+      }
+      const settled = footerAt >= 0;
+      let reply = '';
+      for (let i = (settled ? footerAt - 1 : items.length - 1); i >= 0; i--) {
         const item = items[i];
         if (item.querySelector('[class*="userRow"]')) continue;
-        const text = cleanOf(item.innerText || '');
+        if (isReasoning(item)) continue;
+        const text = cleanOf(rawOf(item));
         if (text.length < 2) continue;
         if (labelOnly.test(text)) continue;
         if (noise.test(text)) continue;
         reply = text; break;
       }
-      return JSON.stringify({ state: thinking ? 'thinking' : 'done', reply: reply, items: items.length });
+      return JSON.stringify({ state: settled ? 'done' : 'thinking', reply: reply, items: items.length });
     })()`;
   }
 
