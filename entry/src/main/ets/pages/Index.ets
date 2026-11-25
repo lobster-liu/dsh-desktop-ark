@@ -576,6 +576,9 @@ struct Index {
       // 注入条目在折叠状态下正文是空的，页面上只剩一个来源标签（真机里读到的就是 12 个字符的
       // 「time-context」，TTS 于是用英文念了一句 time context）。这类条目一律不算回复。
       const labelOnly = /^([Tt]ime-context|[Rr]untime-context|context|上下文注入)$/;
+      // 页面上还有「运行中 / 思考 / 提问 / 等待回答 / 网页搜索」这类**过程状态行**。它们不是回答，
+      // 但会作为最后一条条目出现（真机反馈「出错了，没有等到回复」，实际读到的是状态行）。
+      const statusLine = /^(运行中|运行|思考|提问|等待回答|网页搜索|网页检索|已完成|已取消|进度|耗时)$/;
       const cleanOf = (raw) => {
         const lines = raw.split('\\n');
         const kept = [];
@@ -583,6 +586,7 @@ struct Index {
           const line = lines[k].trim();
           if (line.length === 0) continue;
           if (injected.test(line)) continue;
+          if (statusLine.test(line)) continue;
           kept.push(line);
         }
         return kept.join('\\n').trim();
@@ -612,6 +616,9 @@ struct Index {
     // 「深度求索中」这种字样会残留在被折叠/离屏的容器里，只看它会把已经到达的回复判成
     // 「还在生成」。改成看「回复文本连续两次读到一样」：新条目落地后先渲染、再稳定。
     let candidate: string = '';
+    // 超时也要把「已经看到过的最后一条真实回复」交出去：一轮长任务（联网搜索、长思考）
+    // 经常超过等待窗口，旧实现直接报「没有等到回复」，可页面上其实早就有正文了。
+    let last: string = '';
     while (Date.now() < deadline) {
       await this.sleep(1000);
       let raw: string = '';
@@ -636,12 +643,13 @@ struct Index {
         candidate = '';
         continue;
       }
+      last = reply;
       if (reply === candidate) {
         return reply;
       }
       candidate = reply;
     }
-    return '';
+    return last;
   }
 
   /**
@@ -814,7 +822,7 @@ struct Index {
     }
     this.callState = 'waiting';
     this.callStatus = '等待 DSH 回复…';
-    const reply: string = await this.waitForReply(120000, baseline, baselineItems);
+    const reply: string = await this.waitForReply(240000, baseline, baselineItems);
     if (!this.liveTurn(turnId)) {
       return;
     }
