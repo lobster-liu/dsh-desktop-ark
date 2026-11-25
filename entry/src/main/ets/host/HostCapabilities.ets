@@ -655,8 +655,30 @@ export class HostCapabilities {
       const mic: string = parsed.mic ?? 'auto';
       let stats: CaptureStats | null = null;
       let input: string = 'phone';
-      if (mic === 'bluetooth' && bluetooths.length > 0) {
-        const ordered: audio.AudioDeviceDescriptor[] = HostCapabilities.orderBluetooths(bluetooths);
+      if (mic === 'bluetooth') {
+        // 蓝牙麦的 SCO 链路经常是「睡着」的：系统在 CALL_INPUT_DEVICES 里根本不列它。
+        // 真机取证（2026-11-25T02:25Z）：连着耳机时设备列表只有 type=15（手机麦）；
+        // 但只要先做一次 VOICE_COMMUNICATION 采集，下一次枚举里就冒出 type=7 id=3822。
+        // 所以蓝牙优先的第一步是「叫醒」，而不是直接去找设备。
+        const session: audio.AudioSessionManager | null = await HostCapabilities.beginVoiceSession(context);
+        // 会话一激活，`CALL_INPUT_DEVICES` 里通常就能看到蓝牙麦（panel64 真机日志：usage=8 type=7）。
+        // 所以先直接枚举，只有枚举不到才去叫醒 —— 叫醒要额外丢 0.3 秒，正是「开头几个字没录到」的来源。
+        const preparedAt: number = Date.now();
+        HostCapabilities.logAllInputs(context);
+        // 会话刚激活时设备列表偶尔还没刷新（真机日志里 usages=2/8 都列不到 type=7），
+        // 等一口气再枚举，比直接叫醒（要多丢 0.3 秒）划算得多。
+        await HostCapabilities.delay(120);
+        let awake: audio.AudioDeviceDescriptor[] = HostCapabilities.pickDevices(
+          HostCapabilities.listInputs(context, false), true);
+        if (awake.length === 0) {
+          await HostCapabilities.wakeSco(context);
+          awake = HostCapabilities.pickDevices(HostCapabilities.listInputs(context, false), true);
+          HostCapabilities.appLog(context, `speech.record 蓝牙叫醒后候选 ${awake.length} 个`);
+        } else {
+          HostCapabilities.appLog(context, `speech.record 蓝牙已在列表里，直接录（准备 ${Date.now() - preparedAt}ms）`);
+        }
+        const ordered: audio.AudioDeviceDescriptor[] = HostCapabilities.orderBluetooths(
+          awake.length > 0 ? awake : bluetooths);
         for (let i = 0; i < ordered.length; i++) {
           if (stats !== null) {
             break;
@@ -675,6 +697,7 @@ export class HostCapabilities {
         if (stats === null) {
           HostCapabilities.appLog(context, 'speech.record 蓝牙麦全都没听到人声，改用手机麦');
         }
+        await HostCapabilities.endVoiceSession(context, session);
       }
       if (stats === null) {
         stats = await HostCapabilities.captureSpeech(context, path, options, phone,
@@ -740,6 +763,12 @@ export class HostCapabilities {
 
   /** 列出通话输入设备（`CALL_INPUT_DEVICES` 才含带麦的蓝牙设备；`MEDIA_*` 只有 A2DP 放音）。 */
   private static inputCandidates(context: common.UIAbilityContext): audio.AudioDeviceDescriptor[] {
+    return HostCapabilities.listInputs(context, true);
+  }
+
+  /** 列输入设备；`verbose` 控制是否逐条写日志（叫醒后再枚举时不想刷屏）。 */
+  private static listInputs(context: common.UIAbilityContext,
+    verbose: boolean): audio.AudioDeviceDescriptor[] {
     const out: audio.AudioDeviceDescriptor[] = [];
     try {
       const inputs: audio.AudioDeviceDescriptors = audio.getAudioManager().getRoutingManager()
@@ -747,13 +776,154 @@ export class HostCapabilities {
       for (let i = 0; i < inputs.length; i++) {
         const device: audio.AudioDeviceDescriptor = inputs[i];
         out.push(device);
-        HostCapabilities.appLog(context, `speech.record 输入候选 type=${device.deviceType} id=${device.id}`);
+        if (verbose) {
+          HostCapabilities.appLog(context, `speech.record 输入候选 type=${device.deviceType} id=${device.id}`);
+        }
       }
     } catch (error) {
       const ignored: BusinessError = error as BusinessError;
       console.info(`[${Constants.HILOG_TAG}] 查询输入设备失败：${ignored.message}`);
     }
     return out;
+  }
+
+  /**
+   * 把蓝牙 SCO 链路「叫醒」。
+   *
+   * 真机现象：戴着耳机时 `CALL_INPUT_DEVICES` 里可能一个蓝牙设备都不列；但只要跑过一次
+   * `SOURCE_TYPE_VOICE_COMMUNICATION` 的采集，下一次枚举就会出现 `type=7`。
+   * 这里故意录 0.3 秒丢掉，只为了把这个链路拉起来（时间越短，用户开头的字丢得越少）。
+   */
+  private static async wakeSco(context: common.UIAbilityContext): Promise<void> {
+    const path: string = `${context.filesDir}/runtime/sco-wake.pcm`;
+    const options: CaptureOptions = {
+      autoStop: false, maxMs: 300, silenceMs: 900, minVoicedMs: 400, threshold: 0
+    };
+    try {
+      const stats: CaptureStats = await HostCapabilities.captureSpeech(context, path, options, null,
+        audio.SourceType.SOURCE_TYPE_VOICE_COMMUNICATION);
+      HostCapabilities.appLog(context, `speech.record 蓝牙叫醒 peak=${stats.peak} rms=${stats.rms}`);
+    } catch (error) {
+      const failed: BusinessError = error as BusinessError;
+      HostCapabilities.appLog(context, `speech.record 蓝牙叫醒失败：${failed.code} ${failed.message}`);
+    }
+  }
+
+  /**
+   * 激活「通话」音频会话。
+   *
+   * 这是让系统把 SCO 挂出来的关键：只做一次 `SOURCE_TYPE_VOICE_COMMUNICATION` 采集有时还不够，
+   * 会话场景设成 `AUDIO_SESSION_SCENE_VOICE_COMMUNICATION` 之后，音频策略才会把蓝牙耳机
+   * 当成通话终端（含麦克风）。失败不影响录音，只是蓝牙大概不会出现。
+   */
+  private static async beginVoiceSession(context: common.UIAbilityContext): Promise<audio.AudioSessionManager | null> {
+    try {
+      const session: audio.AudioSessionManager = audio.getAudioManager().getSessionManager();
+      const strategy: audio.AudioSessionStrategy = {
+        concurrencyMode: audio.AudioConcurrencyMode.CONCURRENCY_MIX_WITH_OTHERS
+      };
+      await session.activateAudioSession(strategy);
+      try {
+        session.setAudioSessionScene(audio.AudioSessionScene.AUDIO_SESSION_SCENE_VOICE_COMMUNICATION);
+      } catch (sceneError) {
+        const ignored: BusinessError = sceneError as BusinessError;
+        HostCapabilities.appLog(context, `speech.record 设置通话场景失败：${ignored.code} ${ignored.message}`);
+      }
+      HostCapabilities.appLog(context, 'speech.record 通话音频会话已激活');
+      return session;
+    } catch (error) {
+      const failed: BusinessError = error as BusinessError;
+      HostCapabilities.appLog(context, `speech.record 激活通话会话失败：${failed.code} ${failed.message}`);
+      return null;
+    }
+  }
+
+  /** 结束通话音频会话（不结束会一直占着通话通路，放音会变小声）。 */
+  private static async endVoiceSession(context: common.UIAbilityContext,
+    session: audio.AudioSessionManager | null): Promise<void> {
+    if (session === null) {
+      return;
+    }
+    try {
+      await session.deactivateAudioSession();
+      HostCapabilities.appLog(context, 'speech.record 通话音频会话已结束');
+    } catch (error) {
+      const failed: BusinessError = error as BusinessError;
+      HostCapabilities.appLog(context, `speech.record 结束通话会话失败：${failed.code} ${failed.message}`);
+    }
+  }
+
+  /** 把所有输入设备（媒体输入 + 通话输入）打一遍日志，用来判断耳机到底有没有挂上来。 */
+  private static logAllInputs(context: common.UIAbilityContext): void {
+    const usages: number[] = [audio.DeviceUsage.MEDIA_INPUT_DEVICES, audio.DeviceUsage.CALL_INPUT_DEVICES];
+    for (let u = 0; u < usages.length; u++) {
+      const usage: audio.DeviceUsage = usages[u] as audio.DeviceUsage;
+      try {
+        const devices: audio.AudioDeviceDescriptors =
+          audio.getAudioManager().getRoutingManager().getAvailableDevices(usage);
+        for (let i = 0; i < devices.length; i++) {
+          const device: audio.AudioDeviceDescriptor = devices[i];
+          HostCapabilities.appLog(context,
+            `speech.record 输入清单 usage=${usage} type=${device.deviceType} id=${device.id} name=${device.displayName}`);
+        }
+      } catch (error) {
+        const failed: BusinessError = error as BusinessError;
+        HostCapabilities.appLog(context, `speech.record 枚举输入 usage=${usage} 失败：${failed.code} ${failed.message}`);
+      }
+    }
+  }
+
+  /**
+   * 把「朗读」的音频通路指到耳机上。
+   *
+   * 真机问题（2026-11-25）：戴着只暴露通话通路（SCO/HFP）的眼镜耳机时，系统 TTS 走媒体通路，
+   * 声音直接从手机外放出来。`selectOutputDevice` 是「指定媒体播放设备」的接口，把当前可用的
+   * 蓝牙输出挑一个指过去即可；没有蓝牙输出就保持系统默认（也就不要再动它）。
+   */
+  private static async routeSpeakOutput(context: common.UIAbilityContext): Promise<void> {
+    try {
+      const routing: audio.AudioRoutingManager = audio.getAudioManager().getRoutingManager();
+      const usages: number[] = [audio.DeviceUsage.MEDIA_OUTPUT_DEVICES, audio.DeviceUsage.CALL_OUTPUT_DEVICES];
+      let sco: audio.AudioDeviceDescriptor | null = null;
+      let a2dp: audio.AudioDeviceDescriptor | null = null;
+      for (let u = 0; u < usages.length; u++) {
+        const usage: audio.DeviceUsage = usages[u] as audio.DeviceUsage;
+        let devices: audio.AudioDeviceDescriptors = [];
+        try {
+          devices = routing.getAvailableDevices(usage);
+        } catch (listError) {
+          const failed: BusinessError = listError as BusinessError;
+          HostCapabilities.appLog(context, `speech.speak 枚举输出 usage=${usage} 失败：${failed.code}`);
+          continue;
+        }
+        for (let i = 0; i < devices.length; i++) {
+          const device: audio.AudioDeviceDescriptor = devices[i];
+          HostCapabilities.appLog(context,
+            `speech.speak 输出候选 usage=${usage} type=${device.deviceType} id=${device.id}`);
+          if (device.deviceType === audio.DeviceType.BLUETOOTH_SCO && sco === null) {
+            sco = device;
+          } else if (device.deviceType === audio.DeviceType.BLUETOOTH_A2DP && a2dp === null) {
+            a2dp = device;
+          }
+        }
+      }
+      const target: audio.AudioDeviceDescriptor | null = sco !== null ? sco : a2dp;
+      if (target === null) {
+        HostCapabilities.appLog(context, 'speech.speak 没有蓝牙输出，按系统默认通路朗读');
+        return;
+      }
+      // 26.0.0 的增强路由接口在 AudioDeviceEnhanceManager 上（不在 AudioRoutingManager 上）。
+      const enhance: audio.AudioDeviceEnhanceManager = audio.getAudioManager().getDeviceEnhanceManager();
+      if (!enhance.isEnhancedRoutingSupported()) {
+        HostCapabilities.appLog(context, 'speech.speak 本机不支持增强路由，朗读仍走系统默认');
+        return;
+      }
+      await enhance.selectOutputDevice(target);
+      HostCapabilities.appLog(context, `speech.speak 朗读已指到 type=${target.deviceType} id=${target.id}`);
+    } catch (error) {
+      const failed: BusinessError = error as BusinessError;
+      HostCapabilities.appLog(context, `speech.speak 指定输出设备失败：${failed.code} ${failed.message}`);
+    }
   }
 
   /** 按类型筛设备：蓝牙（SCO，可能多个）或手机麦（MIC）。 */
@@ -1054,6 +1224,8 @@ export class HostCapabilities {
         return JSON.stringify(empty);
       }
       const language: string = parsed.lang !== undefined && parsed.lang.startsWith('en') ? 'en-US' : 'zh-CN';
+      // 先把朗读通路指到耳机：只支持通话（SCO）的眼镜/耳机不指定的话，系统 TTS 会从手机外放出来。
+      await HostCapabilities.routeSpeakOutput(context);
       // 复用引擎：每次 create/shutdown 会把长文本截断（真机只读半句）。
       engine = await HostCapabilities.ensureTtsEngine(language);
       const target: textToSpeech.TextToSpeechEngine = engine;

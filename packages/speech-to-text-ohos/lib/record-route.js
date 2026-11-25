@@ -76,8 +76,17 @@ export function registerRecordRoute(ctx) {
           }
           const body = await readJson(req)
           const durationMs = typeof body.durationMs === 'number' ? body.durationMs : 6000
+          // 调试时经常要试「哪路麦克风」：把面板用的那几个参数一起透传，才能在不点面板的情况下复现。
+          const args = {
+            durationMs,
+            ...(typeof body.maxMs === 'number' ? { maxMs: body.maxMs } : {}),
+            ...(typeof body.silenceMs === 'number' ? { silenceMs: body.silenceMs } : {}),
+            ...(typeof body.minVoicedMs === 'number' ? { minVoicedMs: body.minVoicedMs } : {}),
+            ...(typeof body.autoStop === 'boolean' ? { autoStop: body.autoStop } : {}),
+            ...(typeof body.mic === 'string' ? { mic: body.mic } : {})
+          }
           try {
-            const reply = await invokeHost('speech.record', { durationMs }, { timeoutMs: RECORD_TIMEOUT_MS })
+            const reply = await invokeHost('speech.record', args, { timeoutMs: RECORD_TIMEOUT_MS })
             const result = typeof reply === 'string' ? JSON.parse(reply) : reply
             sendJson(res, 200, result ?? { ok: false, error: 'empty-reply' })
           } catch (error) {

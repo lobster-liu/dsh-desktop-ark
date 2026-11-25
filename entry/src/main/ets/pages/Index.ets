@@ -89,6 +89,8 @@ struct Index {
   @State callReply: string = '';
   /** 云端语音（识别/朗读）失败原因；非空就常驻显示，方便真机上直接看到错误码。 */
   @State callCloudNote: string = '';
+  /** 这一轮用的是哪路麦克风（蓝牙麦/手机麦）+ 时长峰值：常驻到下一轮开始，用户要能看清楚。 */
+  @State callSource: string = '';
   // 每轮通话一个序号：点「挂断」就自增，让还在等待中的旧轮次在下一个 await 之后自行退出。
   // 用户要求「挂断要随时能按，不用等朗读念完」，所以按钮不再按状态禁用，靠这个序号收尾。
   private callTurnId: number = 0;
@@ -597,6 +599,7 @@ struct Index {
     this.callTranscript = '';
     this.callReply = '';
     this.callCloudNote = '';
+    this.callSource = '';
     this.callState = 'listening';
     this.callStatus = '正在听你说…（说完停一下自动结束，最长 30 秒）';
     // 语音设置：停顿档位决定「静音多久算说完」，识别/朗读来源也在里面。
@@ -653,6 +656,11 @@ struct Index {
     this.callState = 'recognizing';
     const stopNote: string = recorded.stopReason === 'empty' ? '没听到声音 · '
       : recorded.stopReason === 'max' ? '到 30 秒上限 · ' : '';
+    // 用户明确要求「输入源的显示别一闪而过」：把这一轮真正用的麦克风常驻到面板上。
+    const micLabel: string = recorded.input === 'bluetooth' ? '蓝牙麦'
+      : (recorded.input === 'phone-fallback' ? '手机麦 · 蓝牙没声' : '手机麦');
+    this.callSource =
+      `${micLabel} · ${((recorded.durationMs ?? 0) / 1000).toFixed(1)} 秒 · 峰值 ${recorded.peak ?? 0}`;
     const audioDetail: string =
       `${stopNote}${((recorded.durationMs ?? 0) / 1000).toFixed(1)}s · ${recorded.bytes ?? 0}B · 采样 ${recorded.sampleRate ?? 0}Hz · 峰值 ${recorded.peak ?? 0} · 来源 ${recorded.input ?? ''}`;
     // 云端优先：离线引擎的中文准确率有上限（同一段录音稳定错在同样的词），云。DeepSeek ASR
@@ -1155,6 +1163,14 @@ struct Index {
               .fontSize(13)
               .fontColor('#0F766E')
               .textAlign(TextAlign.Center)
+
+            if (this.callSource !== '') {
+              Text(this.callSource)
+                .fontSize(11)
+                .fontColor('#0F766E')
+                .width('100%')
+                .textAlign(TextAlign.End)
+            }
 
             if (this.callTranscript !== '') {
               Column({ space: 4 }) {
