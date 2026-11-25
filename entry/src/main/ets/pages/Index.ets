@@ -526,11 +526,26 @@ struct Index {
       // 尾部还有「本轮费。。¥0.005 + 未定价用。/ 16:09 / 已完成，用时 2秒」这类条目，
       // 直接取最后一条会拿到费用行；按噪音正则跳过它们再取。
       const noise = /(本轮费用|深度求索中|已完成|^\\s*\\d{1,2}:\\d{2}\\s*$)/;
+      // 有些轮次会在消息之间插一条「上下文注入」条目（Time sampled while preparing turn …）。
+      // 这种条目没有实际回答，被当成回复就会「只朗读上下文注入」。按行剥掉注入行，
+      // 剥完不剩东西就跳过该条目，继续往前找真正的回答。
+      const injected = /^(Time sampled while preparing|Browser time zone for this request|Elapsed since|Current runtime context|Current working directory|Current DSH file policy|Approval prompts are disabled|\\[memsearch\\]|上下文注入|已注入的上下文)/;
+      const cleanOf = (raw) => {
+        const lines = raw.split('\\n');
+        const kept = [];
+        for (let k = 0; k < lines.length; k++) {
+          const line = lines[k].trim();
+          if (line.length === 0) continue;
+          if (injected.test(line)) continue;
+          kept.push(line);
+        }
+        return kept.join('\\n').trim();
+      };
       let reply = '';
       for (let i = items.length - 1; i >= 0; i--) {
         const item = items[i];
         if (item.querySelector('[class*="userRow"]')) continue;
-        const text = (item.innerText || '').trim();
+        const text = cleanOf(item.innerText || '');
         if (text.length < 2) continue;
         if (noise.test(text)) continue;
         reply = text; break;
