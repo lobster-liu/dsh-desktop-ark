@@ -941,6 +941,9 @@ struct Index {
         .domStorageAccess(true)
         .databaseAccess(true)
         .fileAccess(false)
+        // 云端朗读用页面里的 Audio 播放同源 wav：ArkWeb 默认要求「先有用户手势」才允许发声，
+        // 而我们的手势落在 ArkTS 按钮上、不在页面里，play() 会被 NotAllowedError 拒绝。
+        .mediaPlayGestureAccess(false)
         // 自动填充会拉起系。AutoFillAbility 窗口，真机上会让 Web 表面变黑（HAD-W32/API26 实测）。
         // 关闭后输入框仍可正常键入；调试亦可用 CDP。
         .enableAutoFill(false)
