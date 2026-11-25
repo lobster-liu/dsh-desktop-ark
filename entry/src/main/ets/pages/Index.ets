@@ -11,6 +11,7 @@ import {
   CloudVoiceSettings,
   defaultVoiceSettings,
   deriveTtsBase,
+  micLabel,
   pauseLabel,
   pauseSilenceMs,
   readVoiceSettings,
@@ -47,6 +48,8 @@ interface CloudTtsState {
   state?: string;
   url?: string;
   error?: string;
+  /** 失败码（如 speech/no-speakable-text），面板据此决定是报错还是静默跳过。 */
+  code?: string;
 }
 
 /** 页面音频的播放状态。*/
@@ -114,6 +117,7 @@ struct Index {
   @State vtRecognizer: string = 'auto';
   @State vtPause: string = 'normal';
   @State vtVoice: string = 'system';
+  @State vtMic: string = 'auto';
   @State vtKey: string = '';
   @State vtAsrBase: string = '';
   @State vtAsrModel: string = '';
@@ -600,7 +604,7 @@ struct Index {
     // 先开录、再准备会话：会话探测/打开可能要几百毫秒到几秒，放在录音之前会把用户开口的
     // 头几个字整段丢掉（真机反馈「识别前边的拾音会缺失好几秒」）。录音在宿主侧跑，页面这边
     // 同时去开会话，两边并行。
-    const recording = HostCapabilities.recordForCall(context, 30000, pauseSilenceMs(settings.pause));
+    const recording = HostCapabilities.recordForCall(context, 30000, pauseSilenceMs(settings.pause), settings.mic);
     // 首页没有会话视图时，自动打开最近的会话：让用户「先去点会话、再回来点说话」太别扭（真机踩过）。
     let sessionReady: boolean = false;
     try {
@@ -753,13 +757,50 @@ struct Index {
    * 云端朗读的播放发生在页面里（页面里的 `Audio` 才能直接吃同源音频流），所以这里
    * 做三件事：让页面发起合成 → 轮询合成结果 → 播完后轮询播放状态，直到播完或被打断。
    */
+  /**
+   * 挑出「念得出来」的字符：中日韩/拉丁/数字/空白与中英标点，其余（表情、符号、
+   * 代理对、Markdown 记号）一律换成空格。
+   *
+   * ArkTS 里没有 `\p{L}` 这种属性转义，也避免用 `u` 标志的正则，所以逐码点过滤。
+   */
+  private speakableOf(text: string): string {
+    const stripped: string = text.replace(/```[\s\S]*?```/g, ' ');
+    let out: string = '';
+    for (let i = 0; i < stripped.length; i++) {
+      const code: number = stripped.charCodeAt(i);
+      const high: boolean = code >= 0xD800 && code <= 0xDBFF;
+      const low: boolean = code >= 0xDC00 && code <= 0xDFFF;
+      if (high || low) {
+        out += ' ';
+        continue;
+      }
+      const ascii: boolean = (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+      const cjk: boolean = (code >= 0x4E00 && code <= 0x9FFF) || (code >= 0x3400 && code <= 0x4DBF);
+      const kana: boolean = (code >= 0x3040 && code <= 0x30FF) || (code >= 0xAC00 && code <= 0xD7AF);
+      const punct: boolean = (code >= 0x3000 && code <= 0x303F) || (code >= 0xFF00 && code <= 0xFFEF);
+      const space: boolean = code === 0x20 || code === 0x0A || code === 0x09;
+      out += (ascii || cjk || kana || punct || space) ? stripped.charAt(i) : ' ';
+    }
+    return out.replace(/[*_`#>~|]/g, ' ').replace(/[ \t]+/g, ' ').replace(/\n{2,}/g, '\n').trim();
+  }
+
   private async playReply(context: common.UIAbilityContext, text: string, turnId: number, useCloud: boolean): Promise<void> {
+    // 模型偶尔只回一个表情（😄 / 👌）。这种文本云端一定回 400、系统 TTS 也念不出东西，
+    // 真机上表现为「红字报云端合成失败」——用户看到的就是这个。先把可朗读的字挑出来，
+    // 一个都没有就静默跳过，不报错、不朗读。
+    const speakable: string = this.speakableOf(text);
+    if (speakable === '') {
+      this.callStatus = '回复里只有表情或符号，跳过朗读';
+      this.callCloudNote = '';
+      return;
+    }
     if (useCloud) {
       this.callStatus = '正在合成云端语音…';
       try {
-        await this.evalInPage(this.buildCloudTtsScript(text));
+        await this.evalInPage(this.buildCloudTtsScript(speakable));
         let url: string = '';
         let cloudError: string = '';
+        let cloudCode: string = '';
         // CosyVoice 合成速度约 8 字/秒（200 字≈25 秒），长回复要分几十秒才回来，等 2 分钟。
         for (let i = 0; i < 400; i++) {
           await this.sleep(300);
@@ -774,6 +815,7 @@ struct Index {
           }
           if (state.state === 'error') {
             cloudError = state.error ?? '未知原因';
+            cloudCode = state.code ?? '';
             break;
           }
           if (i % 10 === 9) {
@@ -805,6 +847,11 @@ struct Index {
           }
         }
         if (cloudError !== '') {
+          if (cloudCode === 'speech/no-speakable-text') {
+            this.callStatus = '回复里只有表情或符号，跳过朗读';
+            this.callCloudNote = '';
+            return;
+          }
           this.callStatus = `云端合成失败：${cloudError}，改用手机朗读`;
           this.callCloudNote = `云端朗读失败：${cloudError}`;
         } else {
@@ -821,7 +868,7 @@ struct Index {
       }
     }
     this.callStatus = '正在朗读回复…';
-    const spoken = await HostCapabilities.speakForCall(context, text);
+    const spoken = await HostCapabilities.speakForCall(context, speakable);
     // 引擎的 onComplete 会提前报（实测 143 字在 +1.4s 就说完成，真实朗读约 30s），
     // 所以按字数估算的时长把「朗读中」保持住，别让用户以为读完了去点「说话」把它掐断。
     const waitMs: number = spoken.estimateMs !== undefined ? spoken.estimateMs : 3000;
@@ -846,7 +893,8 @@ struct Index {
             window.__dshTts = { state: 'ready', url: data.url, error: '' };
           } else {
             const message = data && data.error && data.error.message ? data.error.message : ('HTTP ' + response.status);
-            window.__dshTts = { state: 'error', url: '', error: message };
+            const code = data && data.error && data.error.code ? data.error.code : '';
+            window.__dshTts = { state: 'error', url: '', error: message, code: code };
           }
         } catch (error) {
           window.__dshTts = { state: 'error', url: '', error: String(error) };
@@ -1265,6 +1313,17 @@ struct Index {
               }
               .width('100%')
 
+              Text('麦克风')
+                .fontSize(12)
+                .fontColor('#6B7280')
+                .width('100%')
+              Flex({ wrap: FlexWrap.Wrap }) {
+                this.chipMic('自动（手机麦）', 'auto')
+                this.chipMic('蓝牙耳机优先', 'bluetooth')
+                this.chipMic('只用手机麦', 'phone')
+              }
+              .width('100%')
+
               Text('朗读')
                 .fontSize(12)
                 .fontColor('#6B7280')
@@ -1466,6 +1525,21 @@ struct Index {
       })
   }
 
+  /** 麦克风策略芯片。*/
+  @Builder
+  chipMic(label: string, value: string) {
+    Text(label)
+      .fontSize(12)
+      .fontColor(this.vtMic === value ? '#0B3B34' : '#374151')
+      .padding({ left: 10, right: 10, top: 6, bottom: 6 })
+      .margin({ right: 6, bottom: 6 })
+      .borderRadius(14)
+      .backgroundColor(this.vtMic === value ? '#7FD3C4' : '#F1F5F4')
+      .onClick((): void => {
+        this.vtMic = value;
+      })
+  }
+
   /** 朗读来源芯片。*/
   @Builder
   chipVoice(label: string, value: string) {
@@ -1534,6 +1608,7 @@ struct Index {
     this.vtRecognizer = settings.recognizer;
     this.vtPause = settings.pause;
     this.vtVoice = settings.voice;
+    this.vtMic = settings.mic;
     this.vtKey = settings.cloud.key;
     this.vtAsrBase = settings.cloud.asrBase;
     this.vtAsrModel = settings.cloud.asrModel;
@@ -1583,6 +1658,7 @@ struct Index {
       recognizer: this.vtRecognizer,
       voice: this.vtVoice,
       pause: this.vtPause,
+      mic: this.vtMic,
       cloud: cloud
     };
     const ok: boolean = writeVoiceSettings(context, settings);
@@ -1606,7 +1682,7 @@ struct Index {
     if (voiceWarn) {
       fixes.push('v3.5-flash 只认克隆/设计音色 ID，系统音色请改用 cosyvoice-v3-flash');
     }
-    const base: string = `已保存：识别=${recognizerLabel(this.vtRecognizer)}，停顿=${pauseLabel(this.vtPause)}，朗读=${voiceLabel(this.vtVoice)}`;
+    const base: string = `已保存：识别=${recognizerLabel(this.vtRecognizer)}，麦克风=${micLabel(this.vtMic)}，停顿=${pauseLabel(this.vtPause)}，朗读=${voiceLabel(this.vtVoice)}`;
     this.settingsNote = fixes.length === 0 ? base : `${base}（${fixes.join('；')}）`;
   }
 }

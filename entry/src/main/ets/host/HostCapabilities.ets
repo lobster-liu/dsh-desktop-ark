@@ -111,6 +111,8 @@ interface RecordArgs {
   threshold?: number;
   /** 蓝牙优先时，蓝牙麦多少毫秒内没听到人声就回落手机麦（默认 2500ms）。 */
   probeMs?: number;
+  /** 麦克风策略：auto（手机麦优先）/ bluetooth（蓝牙优先）/ phone（只用手机麦）。 */
+  mic?: string;
 }
 
 /** 一次录音的停止原因：说完自动停 / 到了时长上限 / 字节上限。 */
@@ -642,22 +644,47 @@ export class HostCapabilities {
       const phones: audio.AudioDeviceDescriptor[] = HostCapabilities.pickDevices(candidates, false);
       const bluetooths: audio.AudioDeviceDescriptor[] = HostCapabilities.pickDevices(candidates, true);
       const phone: audio.AudioDeviceDescriptor | null = phones.length > 0 ? phones[0] : null;
-      // 手机麦立刻开录，不做任何前置探测。
-      // 真机实测：蓝牙 SCO 通路上拿不到音频（探测峰值个位数），而先把 2.5 秒花在它上面，
-      // 用户开口的头几个字就整段丢了（用户反馈「识别前边的拾音会缺失好几秒」）。
-      // 所以顺序反过来：先录手机麦；只有「手机麦一个音节都没听到」时才回头试蓝牙（罕见路径）。
-      let stats: CaptureStats = await HostCapabilities.captureSpeech(context, path, options, phone,
-        audio.SourceType.SOURCE_TYPE_VOICE_RECOGNITION);
+      // 麦克风策略（语音设置里可切）：
+      //   auto（默认）  手机麦立刻开录；只有手机麦一个音节都没听到时才回头试蓝牙（罕见路径）。
+      //   bluetooth     蓝牙优先：直接拿蓝牙麦开录，逐个设备真录，谁先听到人声就整轮用它。
+      //                 真机取证（2026-11-23T14:03Z）：蓝牙麦 id=2587 收过 peak=23819、
+      //                 voiced=8540ms 的整句；当时之所以能成功，是那一轮把设备挑对了。
+      //                 现在蓝牙设备列表里常混着历史配对残留（id 2581/2584/2587 等），
+      //                 不做「逐个试」就必然经常挑到死通道，看起来像「蓝牙又不行了」。
+      //   phone         只用手机麦。
+      const mic: string = parsed.mic ?? 'auto';
+      let stats: CaptureStats | null = null;
       let input: string = 'phone';
-      if (stats.voicedMs === 0 && bluetooths.length > 0 && Date.now() >= HostCapabilities.btRetryAt) {
-        HostCapabilities.appLog(context, 'speech.record 手机麦没听到人声，回头再试蓝牙麦');
-        let pick: audio.AudioDeviceDescriptor = bluetooths[0];
-        for (let i = 0; i < bluetooths.length; i++) {
-          if (bluetooths[i].id === HostCapabilities.btCandidateId) {
-            pick = bluetooths[i];
+      if (mic === 'bluetooth' && bluetooths.length > 0) {
+        const ordered: audio.AudioDeviceDescriptor[] = HostCapabilities.orderBluetooths(bluetooths);
+        for (let i = 0; i < ordered.length; i++) {
+          if (stats !== null) {
             break;
           }
+          const attempt: CaptureStats = await HostCapabilities.captureSpeech(context, path, options, ordered[i],
+            audio.SourceType.SOURCE_TYPE_VOICE_COMMUNICATION);
+          HostCapabilities.appLog(context,
+            `speech.record 蓝牙尝试 id=${ordered[i].id} peak=${attempt.peak} voiced=${attempt.voicedMs}ms reason=${attempt.stopReason}`);
+          if (attempt.voicedMs > 0) {
+            stats = attempt;
+            input = 'bluetooth';
+            HostCapabilities.btCandidateId = ordered[i].id;
+            HostCapabilities.btRetryAt = 0;
+          }
         }
+        if (stats === null) {
+          HostCapabilities.appLog(context, 'speech.record 蓝牙麦全都没听到人声，改用手机麦');
+        }
+      }
+      if (stats === null) {
+        stats = await HostCapabilities.captureSpeech(context, path, options, phone,
+          audio.SourceType.SOURCE_TYPE_VOICE_RECOGNITION);
+        input = 'phone';
+      }
+      if (mic === 'auto' && stats.voicedMs === 0 && bluetooths.length > 0
+        && Date.now() >= HostCapabilities.btRetryAt) {
+        HostCapabilities.appLog(context, 'speech.record 手机麦没听到人声，回头再试蓝牙麦');
+        const ordered: audio.AudioDeviceDescriptor[] = HostCapabilities.orderBluetooths(bluetooths);
         const retryMaxMs: number = Math.min(maxMs, 8000);
         const retryOptions: CaptureOptions = {
           autoStop: true,
@@ -666,36 +693,42 @@ export class HostCapabilities {
           minVoicedMs: 200,
           threshold: 0
         };
-        const attempt: CaptureStats = await HostCapabilities.captureSpeech(context, path, retryOptions, pick,
-          audio.SourceType.SOURCE_TYPE_VOICE_COMMUNICATION);
-        HostCapabilities.appLog(context,
-          `speech.record 蓝牙重试 id=${pick.id} peak=${attempt.peak} voiced=${attempt.voicedMs}ms reason=${attempt.stopReason}`);
-        if (attempt.voicedMs > 0) {
-          stats = attempt;
-          input = 'bluetooth';
-          HostCapabilities.btCandidateId = pick.id;
-          HostCapabilities.btRetryAt = 0;
-        } else {
+        for (let i = 0; i < ordered.length; i++) {
+          const attempt: CaptureStats = await HostCapabilities.captureSpeech(context, path, retryOptions,
+            ordered[i], audio.SourceType.SOURCE_TYPE_VOICE_COMMUNICATION);
+          HostCapabilities.appLog(context,
+            `speech.record 蓝牙重试 id=${ordered[i].id} peak=${attempt.peak} voiced=${attempt.voicedMs}ms reason=${attempt.stopReason}`);
+          if (attempt.voicedMs > 0) {
+            stats = attempt;
+            input = 'bluetooth';
+            HostCapabilities.btCandidateId = ordered[i].id;
+            HostCapabilities.btRetryAt = 0;
+            break;
+          }
+        }
+        if (input !== 'bluetooth') {
           // 走不通：5 分钟内不再为了它多花时间。
           HostCapabilities.btCandidateId = -1;
           HostCapabilities.btRetryAt = Date.now() + 300000;
-          input = 'phone';
         }
       }
+      const finalStats: CaptureStats = stats !== null ? stats : {
+        bytes: 0, totalMs: 0, rate: 16000, peak: 0, rms: 0, voicedMs: 0, stopReason: 'empty'
+      };
       const result: RecordResult = {
-        ok: stats.bytes > 0,
+        ok: finalStats.bytes > 0,
         path: path,
-        bytes: stats.bytes,
-        durationMs: stats.totalMs,
-        sampleRate: stats.rate,
-        peak: stats.peak,
-        rms: stats.rms,
+        bytes: finalStats.bytes,
+        durationMs: finalStats.totalMs,
+        sampleRate: finalStats.rate,
+        peak: finalStats.peak,
+        rms: finalStats.rms,
         input: input,
-        stopReason: stats.stopReason,
-        voicedMs: stats.voicedMs
+        stopReason: finalStats.stopReason,
+        voicedMs: finalStats.voicedMs
       };
       HostCapabilities.appLog(context,
-        `speech.record done: ${stats.bytes}B ${stats.totalMs}ms stop=${stats.stopReason} voiced=${stats.voicedMs}ms rate=${stats.rate} peak=${stats.peak} rms=${stats.rms} input=${input} -> ${path}`);
+        `speech.record done: ${finalStats.bytes}B ${finalStats.totalMs}ms stop=${finalStats.stopReason} voiced=${finalStats.voicedMs}ms rate=${finalStats.rate} peak=${finalStats.peak} rms=${finalStats.rms} input=${input} -> ${path}`);
       return JSON.stringify(result);
     } catch (error) {
       const failed: BusinessError = error as BusinessError;
@@ -741,6 +774,31 @@ export class HostCapabilities {
     wantBluetooth: boolean): audio.AudioDeviceDescriptor | null {
     const list: audio.AudioDeviceDescriptor[] = HostCapabilities.pickDevices(devices, wantBluetooth);
     return list.length > 0 ? list[0] : null;
+  }
+
+  /**
+   * 蓝牙设备按「上次真的听到人声的那个」排在最前，其余保持系统顺序。
+   *
+   * 真机里同时能看到多个 BLUETOOTH_SCO 设备（历史配对残留），其中只有一个真的在收音频；
+   * 之前固定取第一个，一旦第一个是死通道，就表现为「蓝牙又收不到音了」。
+   */
+  private static orderBluetooths(bluetooths: audio.AudioDeviceDescriptor[]): audio.AudioDeviceDescriptor[] {
+    const out: audio.AudioDeviceDescriptor[] = [];
+    let cached: audio.AudioDeviceDescriptor | null = null;
+    for (let i = 0; i < bluetooths.length; i++) {
+      if (bluetooths[i].id === HostCapabilities.btCandidateId) {
+        cached = bluetooths[i];
+      }
+    }
+    if (cached !== null) {
+      out.push(cached);
+    }
+    for (let i = 0; i < bluetooths.length; i++) {
+      if (cached === null || bluetooths[i].id !== cached.id) {
+        out.push(bluetooths[i]);
+      }
+    }
+    return out;
   }
   /** 列出通话输入设备（`CALL_INPUT_DEVICES` 才含带麦的蓝牙设备；`MEDIA_*` 只有 A2DP 放音）。 */
   /** 诊断用：按不同「设备 × 采集源」组合录一段，比较峰值，判断蓝牙麦到底走哪条路。 */
@@ -1070,11 +1128,13 @@ export class HostCapabilities {
    *
    * 页面在 ArkTS 侧，不走宿主桥的 JSON 字符串协议，所以这里给一层类型化的薄包装。
    */
-  static async recordForCall(context: common.UIAbilityContext, maxMs: number, silenceMs: number = 900): Promise<RecordResult> {
+  static async recordForCall(context: common.UIAbilityContext, maxMs: number, silenceMs: number = 900,
+    mic: string = 'auto'): Promise<RecordResult> {
     // autoStop：说话一停就收尾，maxMs 只当安全上限（面板给 30 秒）；
     // silenceMs 由「语音设置」里的停顿档位决定（快 500 / 普通 900 / 耐心 1800）。
+    // mic 由「麦克风」档位决定（自动 / 蓝牙优先 / 只用手机麦）。
     const raw: string = await HostCapabilities.record(context,
-      JSON.stringify({ maxMs: maxMs, autoStop: true, silenceMs: silenceMs, minVoicedMs: 400 }));
+      JSON.stringify({ maxMs: maxMs, autoStop: true, silenceMs: silenceMs, minVoicedMs: 400, mic: mic }));
     return JSON.parse(raw) as RecordResult;
   }
 

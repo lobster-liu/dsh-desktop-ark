@@ -343,6 +343,33 @@ export async function synthesizeCloud(text, cloud) {
  * 注册合成与回放两条路由。
  * @param {import('@deepseek-ai/cordis').Context} ctx
  */
+/**
+ * 把回复文本收成「念得出来」的形状。
+ *
+ * 真机教训（2026-11-25）：模型偶尔只回一个表情（😄 / 👌），CosyVoice 和 Qwen 都会回
+ * `HTTP 400 InvalidParameter · Please ensure input text is valid`，面板于是红字报
+ * 「云端合成失败」。这种文本本来也没什么可念的，先剥掉代码块、Markdown 标记和表情符号，
+ * 再判断还剩没剩下能读的字。
+ */
+const SPEAKABLE_CHAR = /[0-9A-Za-z\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/
+
+export function speakableText(text) {
+  let clean = String(text ?? '')
+  clean = clean.replace(/```[\s\S]*?```/g, ' ')
+  clean = clean.replace(/`([^`\n]*)`/g, '$1')
+  clean = clean.replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
+  clean = clean.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+  clean = clean.replace(/^[ \t]*[#>*+-]+[ \t]*/gm, ' ')
+  clean = clean.replace(/[*_~]{1,3}/g, '')
+  clean = clean.replace(/[\u{1F000}-\u{1FAFF}\u{2190}-\u{27BF}\u{FE0F}\u{200D}\u{20E3}]/gu, ' ')
+  clean = clean.replace(/[ \t\r\n]+/g, ' ')
+  return clean.trim()
+}
+
+export function hasSpeakableText(text) {
+  return SPEAKABLE_CHAR.test(speakableText(text))
+}
+
 export function registerCloudTtsRoute(ctx) {
   const connection = ctx.connection
   const rejected = (req, res) => {
@@ -364,11 +391,23 @@ export function registerCloudTtsRoute(ctx) {
             return
           }
           const body = await readJson(req)
-          const text = typeof body.text === 'string' ? body.text.trim() : ''
-          if (text === '') {
+          const raw = typeof body.text === 'string' ? body.text : ''
+          if (raw.trim() === '') {
             sendJson(res, 400, { ok: false, error: { code: 'missing-text', message: 'body.text is required' } })
             return
           }
+          // 只有表情/符号的回复：上游一定 400，提前挡掉，让面板「静默跳过朗读」。
+          if (!hasSpeakableText(raw)) {
+            sendJson(res, 422, {
+              ok: false,
+              error: {
+                code: 'speech/no-speakable-text',
+                message: '这段回复里没有可朗读的文字（只有表情或符号）'
+              }
+            })
+            return
+          }
+          const text = speakableText(raw)
           const settings = readSettings()
           const cloud = settings.cloud
           if (cloud.key === '') {
