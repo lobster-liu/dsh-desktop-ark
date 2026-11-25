@@ -58,6 +58,12 @@ interface SpeakPlaybackState {
   error?: string;
 }
 
+/** 输入框（Lexical）的当前文本，用来确认「写进去了没有」。*/
+interface ComposerText {
+  text?: string;
+  missing?: boolean;
+}
+
 
 /**
  * 单页外壳：ArkWeb 承载 dsh Web UI；启动期间叠加加。错误视图。
@@ -445,6 +451,10 @@ struct Index {
   private buildSendScript(text: string): string {
     const literal: string = JSON.stringify(text);
     return `(() => {
+      // 一律按 dsh.sessions.current 里记的会话 id 用 XHR 直发，不碰输入框。
+      // 早前空会话走「写输入框 + 点发送」，代价是 focus 会把软键盘顶出来（真机反馈），
+      // 而且写完 DOM 异步更新、读回容易误判。实测点「新建会话」后 current 会立刻指向新会话，
+      // 空会话直发也能正确落进新会话并在页面上渲染出问答，所以输入框那条路彻底不用了。
       let sessionId = '';
       try {
         const raw = localStorage.getItem('dsh.sessions.current');
@@ -484,6 +494,27 @@ struct Index {
     })()`;
   }
 
+  /** 读回输入框当前内容（保留：真机排查「字到底写没写进去」时用得上）。*/
+  private buildComposerTextScript(): string {
+    return `(() => {
+      const ed = document.querySelector('[contenteditable="true"]');
+      if (!ed) { return JSON.stringify({ text: '', missing: true }); }
+      return JSON.stringify({ text: (ed.innerText || '').trim() });
+    })()`;
+  }
+
+  /**
+   * 把这一轮文本发出去：按 `dsh.sessions.current` 用同步 XHR 直发 `/api/session/prompt`。
+   *
+   * 为什么不写输入框：写输入框要先 focus，真机上会把软键盘顶出来（用户反馈「语音录入阶段就弹键盘」）；
+   * 而且 Lexical 写完 DOM 是异步的，读回容易误判。实测空会话（刚点「新建会话」）直发也能落进新会话
+   * 并在页面上渲染出问答，所以只留这一条路。
+   */
+  private async sendTurn(text: string): Promise<string> {
+    // 一律 XHR 直发（见 buildSendScript 的注释）：不再碰页面输入框，也就不会把软键盘顶出来。
+    return this.evalInPage(this.buildSendScript(text));
+  }
+
   /**
    * 云端识别一条录音（DeepSeek ASR，账号代付）。
    *
@@ -521,7 +552,19 @@ struct Index {
         const col = document.querySelector('[class*="_column"]');
         if (col) { items = Array.from(col.children); }
       }
-      if (items.length === 0) return JSON.stringify({ state: 'no-column', reply: '', items: 0 });
+      if (items.length === 0) {
+        // 空会话（刚点「新建会话」）和首页长得一样：都沿用 hero 布局、都带「选择工作区 /
+        // 标准模式」按钮，localStorage 里的 sessionId 也还是上一段的（实测点「新建会话」
+        // 之后 dsh.sessions.current 不变）。所以这里不区分首页/空白会话，一律当成「可以发」：
+        // 发送那一步对空会话走输入框，由页面自己决定落到哪个会话。
+        // 之前把这种情况判成「没有会话」并去点侧栏旧会话行，结果新会话的第一轮消息被发进了
+        // 上一段对话（真机反馈「新会话第一轮就不正经回复」）。
+        const composer = document.querySelector('[contenteditable="true"]');
+        if (composer) {
+          return JSON.stringify({ state: 'empty-session', reply: '', items: 0 });
+        }
+        return JSON.stringify({ state: 'no-column', reply: '', items: 0 });
+      }
       const thinking = (document.body.innerText || '').indexOf('深度求索中') >= 0;
       // 尾部还有「本轮费。。¥0.005 + 未定价用。/ 16:09 / 已完成，用时 2秒」这类条目，
       // 直接取最后一条会拿到费用行；按噪音正则跳过它们再取。
@@ -529,7 +572,10 @@ struct Index {
       // 有些轮次会在消息之间插一条「上下文注入」条目（Time sampled while preparing turn …）。
       // 这种条目没有实际回答，被当成回复就会「只朗读上下文注入」。按行剥掉注入行，
       // 剥完不剩东西就跳过该条目，继续往前找真正的回答。
-      const injected = /^(Time sampled while preparing|Browser time zone for this request|Elapsed since|Current runtime context|Current working directory|Current DSH file policy|Approval prompts are disabled|\\[memsearch\\]|上下文注入|已注入的上下文)/;
+      const injected = /^(Time sampled while preparing|Browser time zone for this request|Elapsed since|Current runtime context|Current working directory|Current DSH file policy|Approval prompts are disabled|\\[memsearch\\]|上下文注入|已注入的上下文|[Tt]ime-context|[Rr]untime-context|context)/;
+      // 注入条目在折叠状态下正文是空的，页面上只剩一个来源标签（真机里读到的就是 12 个字符的
+      // 「time-context」，TTS 于是用英文念了一句 time context）。这类条目一律不算回复。
+      const labelOnly = /^([Tt]ime-context|[Rr]untime-context|context|上下文注入)$/;
       const cleanOf = (raw) => {
         const lines = raw.split('\\n');
         const kept = [];
@@ -547,6 +593,7 @@ struct Index {
         if (item.querySelector('[class*="userRow"]')) continue;
         const text = cleanOf(item.innerText || '');
         if (text.length < 2) continue;
+        if (labelOnly.test(text)) continue;
         if (noise.test(text)) continue;
         reply = text; break;
       }
@@ -622,6 +669,13 @@ struct Index {
     this.callReply = '';
     this.callCloudNote = '';
     this.callSource = '';
+    // 空白会话/首页的输入框会被页面自己自动聚焦，真机上表现为「刚点说话就把软键盘顶出来」。
+    // 录音前先把页面焦点收掉——语音通话全程用不到键盘。
+    try {
+      await this.evalInPage(this.buildBlurScript());
+    } catch (error) {
+      // 收不掉也不影响录音。
+    }
     this.callState = 'listening';
     this.callStatus = '正在听你说…（说完停一下自动结束，最长 30 秒）';
     // 语音设置：停顿档位决定「静音多久算说完」，识别/朗读来源也在里面。
@@ -748,7 +802,7 @@ struct Index {
     }
     let sent: string = '';
     try {
-      sent = await this.evalInPage(this.buildSendScript(text));
+      sent = await this.sendTurn(text);
     } catch (error) {
       const failed: BusinessError = error as BusinessError;
       sent = failed.message;
