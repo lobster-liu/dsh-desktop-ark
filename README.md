@@ -58,6 +58,22 @@ Neither replaces the other: the Electron edition buys maximum desktop fidelity a
 
 The complete matrix — every capability, both editions side by side, with root causes and fix points — is [`docs/鸿蒙环境能力清单-0.2.1.md`](docs/鸿蒙环境能力清单-0.2.1.md).
 
+## Voice call (half-duplex)
+
+The glass orb in the top-right corner of a conversation is the voice-call entry: speak once → it transcribes → sends into the current session → reads the answer back. Device-tuned to working state on the phone (`call-panel74` / `d1a2426`):
+
+| Stage | Implementation |
+|---|---|
+| Capture | VAD auto-stop (pause presets `0.7 / 1.3 / 2.2 s`) plus a `0.4 s` tail; microphone source `Bluetooth-first / auto / phone-only`; the headset mic needs a 0.5 s SCO "wake" capture before it shows up |
+| Transcribe | Cloud `qwen3-asr-flash` (Alibaba DashScope workspace domain) first; falls back to the platform offline engine (2–6 s segments, split on pauses) |
+| Send | Synchronous XHR in the page to `POST /api/session/prompt` (`mode=queue`) — never touches the composer, so no soft keyboard |
+| Read aloud | Cloud `qwen3-tts-flash` / `cosyvoice-v3-flash` (chunked, 3-way concurrent, concatenated WAV) first, system TTS as fallback; output follows the system route (headset/glasses A2DP verified) |
+| Read reply | A turn counts as finished only when its cost footer (`本轮费用` / `timeEnd`) appears; reasoning blocks, progress rows and context-injection lines are skipped; 240 s window, and a timeout still speaks whatever text already arrived |
+
+Settings (recogniser, pause preset, voice source, microphone, cloud key/endpoints/models/voice) live in the panel's **Settings** sheet and persist to the app sandbox at `runtime/voice-settings.json`, shared by the ArkTS UI and the bundled Node side. Full chain, build steps and a troubleshooting table: [`docs/030-语音通话面板.md`](docs/030-语音通话面板.md).
+
+Known limits: still **half-duplex** (you cannot talk while a reply is being read); full duplex and live captions are not implemented yet, and the system TTS truncates long texts, so long replies must go through cloud speech.
+
 ## Status
 
 `0.2.2` (`versionCode` 202) — **built** for dsh-v0.2.2-rc.3 on Node 26.13.0. Device-verified on **two forms**: `0.2.1` on HarmonyOS 6.1.0.135 / API 24 (2in1) and `0.2.2` on a **HUAWEI Pura X Max (`HOP-AL10`, HarmonyOS 7.0.0.111 / API 26, `deviceType=phone`)**. On the phone: installs with zero ACLs, the payload self-extracts and reports `ready`, all shims install, `node:sqlite`/FTS5 available, text and image conversations, workspace picker with sandbox + *From file* import, a **read-only workspace from the system folder picker**, account login (browser-based, via the login bridge), plugin install/uninstall through the marketplace, and **installed plugins survive a payload upgrade** (see [`docs/pnpm+dsh-market.md`](docs/pnpm+dsh-market.md) §3.7). Known gaps and their fix points are listed in the capability inventory above.
@@ -98,6 +114,7 @@ Run `bash scripts/build-hap.sh --debug` to get `entry-default-signed.hap`, which
 | [Engineering plan](docs/000-工程规划.md) | Why this architecture, what was rejected, and the shim whitelist |
 | [On-device notes](docs/010-真机调试记录.md) | What broke on the device and how it was diagnosed |
 | [Phone-form test record](docs/020-手机形态实测记录.md) | Running this edition on a phone: `--jitless` self-check, login, read-only folder workspace, measured numbers |
+| [Voice call panel](docs/030-语音通话面板.md) | The orb: capture/VAD, cloud and offline transcription, cloud speech out, reply-detection rules, settings file, troubleshooting |
 | [JIT and ACL](docs/ACL配置.md) · [JIT-less decision](docs/119-jitless-方案决策.md) | The two runtime forms and what each costs |
 | [Specifications](specs/README.md) | 14 spec modules (013, 101–108, 110, 119, 202, 204, 205) with plans and gates |
 
