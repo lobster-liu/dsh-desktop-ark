@@ -760,7 +760,8 @@ struct Index {
         await this.evalInPage(this.buildCloudTtsScript(text));
         let url: string = '';
         let cloudError: string = '';
-        for (let i = 0; i < 100; i++) {
+        // CosyVoice 合成速度约 8 字/秒（200 字≈25 秒），长回复要分几十秒才回来，等 2 分钟。
+        for (let i = 0; i < 400; i++) {
           await this.sleep(300);
           if (!this.liveTurn(turnId)) {
             return;
@@ -774,6 +775,9 @@ struct Index {
           if (state.state === 'error') {
             cloudError = state.error ?? '未知原因';
             break;
+          }
+          if (i % 10 === 9) {
+            this.callStatus = `正在合成云端语音…（已等 ${Math.round((i + 1) * 0.3)} 秒，长回复会久一点）`;
           }
         }
         if (url !== '') {
@@ -805,7 +809,7 @@ struct Index {
           this.callCloudNote = `云端朗读失败：${cloudError}`;
         } else {
           this.callStatus = '云端合成超时，改用手机朗读';
-          this.callCloudNote = '云端朗读失败：合成超时（30 秒无结果）';
+          this.callCloudNote = '云端朗读失败：合成超时（120 秒无结果）';
         }
       } catch (error) {
         const failed: BusinessError = error as BusinessError;

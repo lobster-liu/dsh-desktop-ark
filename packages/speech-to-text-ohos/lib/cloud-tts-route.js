@@ -26,6 +26,19 @@ export const TTS_AUDIO_PATH = '/_ohos/speech/tts-audio'
 /** Qwen-TTS 单次上限（官方文档：600 字符）。 */
 const QWEN_TEXT_LIMIT = 600
 
+/**
+ * 每段合成的目标字符数：CosyVoice 的合成速度实测约 8 字/秒（200 字 ≈ 25 秒），
+ * 一次塞整段会让页面等几十秒；切成小段并行合成再拼起来，首字节快得多。
+ */
+const COSY_CHUNK = 120
+const QWEN_CHUNK = 300
+
+/** 一次朗读最多合成多少字（超出部分截断，避免为一段超长回复等上一分钟）。 */
+const SPOKEN_LIMIT = 1200
+
+/** 单段合成的超时（毫秒）。 */
+const CHUNK_TIMEOUT_MS = 90 * 1000
+
 /** 临时音频保留时长（毫秒）：超时即删，避免沙箱里堆文件。 */
 const KEEP_MS = 10 * 60 * 1000
 
@@ -130,32 +143,118 @@ function audioOf(parsed) {
 }
 
 /**
- * 调用云端合成，返回音频字节。
+ * 把长文本切成适合单次合成的段：优先在句末标点断开，其次逗号，最后硬切。
  * @param {string} text
- * @param {{ key: string, ttsBase: string, ttsModel: string, ttsVoice: string }} cloud
- * @returns {Promise<{ bytes: Buffer, ext: string, model: string, ms: number, chars: number }>}
+ * @param {number} size
+ * @returns {string[]}
  */
-export async function synthesizeCloud(text, cloud) {
-  const startedAt = Date.now()
+export function splitSpeech(text, size) {
+  const clean = text.replace(/\s+/g, ' ').trim()
+  if (clean === '') return []
+  const budget = size > 20 ? size : 20
+  const pieces = []
+  let rest = clean.slice(0, SPOKEN_LIMIT)
+  while (rest.length > budget) {
+    const window = rest.slice(0, budget + 20)
+    let cut = -1
+    const stops = ['。', '！', '？', '；', '，', '、', '.', '!', '?', ';', ',', '\n']
+    for (const mark of stops) {
+      const at = window.lastIndexOf(mark)
+      if (at >= budget * 0.5 && at > cut) cut = at
+    }
+    if (cut < 0) cut = budget - 1
+    const piece = rest.slice(0, cut + 1).trim()
+    if (piece !== '') pieces.push(piece)
+    rest = rest.slice(cut + 1).trim()
+  }
+  if (rest !== '') pieces.push(rest)
+  return pieces
+}
+
+/**
+ * 解析 WAV：拿到 fmt 块与 data 块。
+ * @param {Buffer} wav
+ * @returns {{ fmt: Buffer, data: Buffer } | null}
+ */
+function parseWav(wav) {
+  if (wav.length < 44 || wav.toString('ascii', 0, 4) !== 'RIFF' || wav.toString('ascii', 8, 12) !== 'WAVE') {
+    return null
+  }
+  let offset = 12
+  let fmt = null
+  let data = null
+  while (offset + 8 <= wav.length) {
+    const id = wav.toString('ascii', offset, offset + 4)
+    const size = wav.readUInt32LE(offset + 4)
+    const body = wav.subarray(offset + 8, Math.min(offset + 8 + size, wav.length))
+    if (id === 'fmt ') fmt = body
+    if (id === 'data') data = body
+    offset += 8 + size + (size % 2)
+  }
+  if (fmt === null || data === null) return null
+  return { fmt, data }
+}
+
+/**
+ * 把多段 WAV 的 PCM 拼成一个 WAV（各段模型相同，格式一致）。
+ * @param {Buffer[]} wavs
+ * @returns {Buffer}
+ */
+export function concatWav(wavs) {
+  const parsed = []
+  for (const wav of wavs) {
+    const parts = parseWav(wav)
+    if (parts === null) return Buffer.concat(wavs)
+    parsed.push(parts)
+  }
+  if (parsed.length === 0) return Buffer.alloc(0)
+  const fmt = parsed[0].fmt
+  const pcm = Buffer.concat(parsed.map((parts) => parts.data))
+  const header = Buffer.alloc(44)
+  header.write('RIFF', 0, 'ascii')
+  header.writeUInt32LE(36 + pcm.length, 4)
+  header.write('WAVE', 8, 'ascii')
+  header.write('fmt ', 12, 'ascii')
+  header.writeUInt32LE(fmt.length, 16)
+  fmt.copy(header, 20)
+  const dataAt = 20 + fmt.length
+  header.write('data', dataAt, 'ascii')
+  header.writeUInt32LE(pcm.length, dataAt + 4)
+  return Buffer.concat([header.subarray(0, dataAt + 8), pcm])
+}
+
+/**
+ * 合成一段文本（带超时）。
+ * @param {string} spoken
+ * @param {{ key: string, ttsBase: string, ttsModel: string, ttsVoice: string }} cloud
+ * @param {boolean} cosy
+ * @returns {Promise<{ bytes: Buffer, ext: string }>}
+ */
+async function synthesizeChunk(spoken, cloud, cosy) {
   const base = cloud.ttsBase.replace(/\/+$/, '')
   const model = cloud.ttsModel
-  const cosy = /^cosyvoice/i.test(model)
-  const spoken = cosy ? text : text.slice(0, QWEN_TEXT_LIMIT)
   const url = cosy
     ? `${base}/services/audio/tts/SpeechSynthesizer`
     : `${base}/services/aigc/multimodal-generation/generation`
   const body = cosy
     ? { model, input: { text: spoken, voice: cloud.ttsVoice, format: 'wav', sample_rate: 24000 } }
     : { model, input: { text: spoken, voice: cloud.ttsVoice, language_type: 'Chinese' } }
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      authorization: `Bearer ${cloud.key}`,
-      'content-type': 'application/json',
-      accept: 'application/json'
-    },
-    body: JSON.stringify(body)
-  })
+  let response
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${cloud.key}`,
+        'content-type': 'application/json',
+        accept: 'application/json'
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(CHUNK_TIMEOUT_MS)
+    })
+  } catch (error) {
+    const reason = error?.name === 'TimeoutError' ? `上游 ${CHUNK_TIMEOUT_MS / 1000} 秒无响应` : String(error?.message ?? error)
+    throw new Error(`云端合成失败（${spoken.length} 字）：${reason}`)
+  }
   const raw = Buffer.from(await response.arrayBuffer()).toString('utf8')
   if (!response.ok) {
     throw new Error(`云端合成失败 HTTP ${response.status}${reasonOf(raw)}`)
@@ -168,21 +267,76 @@ export async function synthesizeCloud(text, cloud) {
   }
   const audio = audioOf(parsed)
   if (audio.url !== '') {
-    const download = await fetch(audio.url)
+    const download = await fetch(audio.url, { signal: AbortSignal.timeout(CHUNK_TIMEOUT_MS) })
     if (!download.ok) throw new Error(`下载合成音频失败 HTTP ${download.status}`)
-    const bytes = Buffer.from(await download.arrayBuffer())
-    return { bytes, ext: audio.ext, model, ms: Date.now() - startedAt, chars: spoken.length }
+    return { bytes: Buffer.from(await download.arrayBuffer()), ext: audio.ext }
   }
   if (audio.data !== '') {
-    return {
-      bytes: Buffer.from(audio.data, 'base64'),
-      ext: cosy ? 'wav' : 'wav',
-      model,
-      ms: Date.now() - startedAt,
-      chars: spoken.length
-    }
+    return { bytes: Buffer.from(audio.data, 'base64'), ext: 'wav' }
   }
   throw new Error(`云端没有返回音频：${raw.slice(0, 300)}`)
+}
+
+/**
+ * 并发跑一组异步任务，保持结果顺序。
+ * @template T
+ * @param {Array<() => Promise<T>>} tasks
+ * @param {number} limit
+ * @returns {Promise<T[]>}
+ */
+async function mapLimit(tasks, limit) {
+  const results = new Array(tasks.length)
+  let next = 0
+  const worker = async () => {
+    while (next < tasks.length) {
+      const index = next
+      next += 1
+      results[index] = await tasks[index]()
+    }
+  }
+  const workers = []
+  for (let i = 0; i < Math.min(limit, tasks.length); i += 1) workers.push(worker())
+  await Promise.all(workers)
+  return results
+}
+
+/**
+ * 调用云端合成，返回音频字节。长文本按标点切成小段，并发合成后拼接。
+ * @param {string} text
+ * @param {{ key: string, ttsBase: string, ttsModel: string, ttsVoice: string }} cloud
+ * @returns {Promise<{ bytes: Buffer, ext: string, model: string, ms: number, chars: number, chunks: number }>}
+ */
+export async function synthesizeCloud(text, cloud) {
+  const startedAt = Date.now()
+  const model = cloud.ttsModel
+  const cosy = /^cosyvoice/i.test(model)
+  const pieceSize = cosy ? COSY_CHUNK : Math.min(QWEN_CHUNK, QWEN_TEXT_LIMIT)
+  const pieces = splitSpeech(text, pieceSize)
+  if (pieces.length === 0) {
+    throw new Error('没有可朗读的文本')
+  }
+  const audios = await mapLimit(
+    pieces.map((piece, index) => async () => {
+      try {
+        const audio = await synthesizeChunk(piece, cloud, cosy)
+        return audio.bytes
+      } catch (error) {
+        const message = String(error?.message ?? error)
+        console.warn(`[speech-to-text-ohos] 合成第 ${index + 1}/${pieces.length} 段失败：${message}`)
+        throw new Error(message)
+      }
+    }),
+    3
+  )
+  const bytes = audios.length === 1 ? audios[0] : concatWav(audios)
+  return {
+    bytes,
+    ext: 'wav',
+    model,
+    ms: Date.now() - startedAt,
+    chars: pieces.join('').length,
+    chunks: audios.length
+  }
 }
 
 /**
@@ -242,6 +396,7 @@ export function registerCloudTtsRoute(ctx) {
               url: `${TTS_AUDIO_PATH}?id=${encodeURIComponent(name)}`,
               bytes: result.bytes.length,
               chars: result.chars,
+              chunks: result.chunks,
               ms: result.ms,
               model: result.model
             })
