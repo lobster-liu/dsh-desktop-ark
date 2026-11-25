@@ -189,23 +189,23 @@ export function writeVoiceSettings(context: common.UIAbilityContext, settings: V
  */
 export function pauseSilenceMs(pause: string): number {
   if (pause === 'quick') {
-    return 500;
+    return 700;
   }
   if (pause === 'patient') {
-    return 1800;
+    return 2200;
   }
-  return 900;
+  return 1300;
 }
 
 /** 设置项的中文标签（面板上显示用）。 */
 export function pauseLabel(pause: string): string {
   if (pause === 'quick') {
-    return '快（0.5 秒）';
+    return '快（0.7 秒）';
   }
   if (pause === 'patient') {
-    return '耐心（1.8 秒）';
+    return '耐心（2.2 秒）';
   }
-  return '普通（0.9 秒）';
+  return '普通（1.3 秒）';
 }
 
 /** 识别方式的中文标签。 */

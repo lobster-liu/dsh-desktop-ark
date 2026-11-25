@@ -1029,6 +1029,9 @@ export class HostCapabilities {
     let samples: number = 0;
     let voicedMs: number = 0;
     let silenceRunMs: number = 0;
+    // 判定「说完」之后再补 0.4 秒：蓝牙通路上最后半个字常常压在静音判定之后，
+    // 直接停会把句尾吞掉（真机反馈「最后一句没转换」）。
+    let tailMs: number = 0;
     let noiseFloor: number = 80;
     let stopReason: string = 'max';
     let done: boolean = false;
@@ -1097,6 +1100,7 @@ export class HostCapabilities {
           if (chunkRms >= threshold) {
             voicedMs += chunkMs;
             silenceRunMs = 0;
+            tailMs = 0;
           } else {
             silenceRunMs += chunkMs;
           }
@@ -1108,8 +1112,15 @@ export class HostCapabilities {
             return;
           }
           if (voicedMs >= options.minVoicedMs && silenceRunMs >= options.silenceMs) {
-            stopReason = 'silence';
-            done = true;
+            // 先补 0.4 秒句尾再收尾（见 tailMs 注释）。
+            if (tailMs <= 0) {
+              tailMs = 400;
+            }
+            tailMs -= chunkMs;
+            if (tailMs <= 0) {
+              stopReason = 'silence';
+              done = true;
+            }
           } else if (options.probeMs !== undefined && options.probeMs > 0 && voicedMs === 0
             && totalMs >= options.probeMs) {
             // 蓝牙优先：这段通路上一直没人声，交给调用方换设备重录。

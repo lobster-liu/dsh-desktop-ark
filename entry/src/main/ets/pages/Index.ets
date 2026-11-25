@@ -547,6 +547,9 @@ struct Index {
    */
   private async waitForReply(timeoutMs: number, baseline: string, baselineItems: number): Promise<string> {
     const deadline: number = Date.now() + timeoutMs;
+    // 「深度求索中」这种字样会残留在被折叠/离屏的容器里，只看它会把已经到达的回复判成
+    // 「还在生成」。改成看「回复文本连续两次读到一样」：新条目落地后先渲染、再稳定。
+    let candidate: string = '';
     while (Date.now() < deadline) {
       await this.sleep(1000);
       let raw: string = '';
@@ -564,13 +567,17 @@ struct Index {
       if (parsed === null) {
         continue;
       }
-      const state: string = parsed.state ?? '';
       const reply: string = parsed.reply ?? '';
       const items: number = parsed.items ?? 0;
       // 条目数也要涨：只看「回复变了」会在上一轮还没渲染完时抢跑。
-      if (state === 'done' && reply.length > 0 && reply !== baseline && items > baselineItems) {
+      if (reply.length === 0 || reply === baseline || items <= baselineItems) {
+        candidate = '';
+        continue;
+      }
+      if (reply === candidate) {
         return reply;
       }
+      candidate = reply;
     }
     return '';
   }
